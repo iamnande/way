@@ -89,7 +89,9 @@ the `family` sometimes `travels` to far-away lands. these `travels` have a
 6. `purpose` / why do we invest in any & all of the above items, perpetually,
    along the way?
 
-> // TODO principles - unsure about a decision? read the principles (NOTE: we
-> can steal/lift heavily from iamnande/iamnande)
->
-> > > > > > > 62a4039 (docs: initial pass at readme for #2)
+## principles
+
+unsure about a decision along the way? read the principles.
+
+- you are not what you have mastered. you are what you are willing to risk
+  becoming.
