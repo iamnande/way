@@ -1,21 +1,41 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::Serialize;
 
-use crate::task::{Pillar, Task};
+use crate::task::{Profile, Task};
 
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tasks");
+const PROFILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("profiles");
+const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settings");
+const ACTIVE_PROFILE_KEY: &str = "active_profile";
+
+#[derive(Debug, Serialize)]
+pub struct TaskTree {
+    pub task: Task,
+    pub ancestors: Vec<Task>,
+    pub descendants: Vec<Task>,
+}
 
 pub trait Store {
     fn add(&self, title: String, description: String, tags: Vec<String>) -> Result<Task>;
+    fn spawn_child(&self, parent_key: u32, title: String, description: String, tags: Vec<String>) -> Result<Task>;
     fn list(&self) -> Result<Vec<Task>>;
     fn list_archived(&self) -> Result<Vec<Task>>;
+    fn find_by_key(&self, key: u32) -> Result<Option<Task>>;
+    fn tree(&self, key: u32) -> Result<TaskTree>;
     fn toggle(&self, id: u64) -> Result<()>;
     fn update_fields(&self, id: u64, title: String, description: String, tags: Vec<String>) -> Result<()>;
     fn archive(&self, id: u64) -> Result<()>;
     fn unarchive(&self, id: u64) -> Result<()>;
-    fn set_pillar(&self, id: u64, pillar: Option<Pillar>) -> Result<()>;
+    fn set_pillar(&self, id: u64, pillar: Option<String>) -> Result<()>;
+    fn link_external(&self, id: u64, external_ref: Option<String>) -> Result<()>;
+    fn set_session_state(&self, id: u64, state: Option<String>) -> Result<()>;
+    fn list_profiles(&self) -> Result<Vec<Profile>>;
+    fn active_profile(&self) -> Result<Profile>;
+    fn use_profile(&self, name: &str) -> Result<()>;
+    fn add_profile(&self, profile: Profile) -> Result<()>;
 }
 
 pub struct RedbStore {
@@ -27,26 +47,32 @@ impl RedbStore {
         let db = Database::create(path.as_ref())?;
         let write_txn = db.begin_write()?;
         write_txn.open_table(TABLE)?;
+        write_txn.open_table(PROFILES_TABLE)?;
+        write_txn.open_table(SETTINGS_TABLE)?;
         write_txn.commit()?;
+
         let store = Self { db };
         store.backfill_keys()?;
+        store.normalize_pillars()?;
+        store.bootstrap_default_profile()?;
         Ok(store)
+    }
+
+    fn all_tasks(&self) -> Result<Vec<Task>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(TABLE)?;
+        let tasks: Vec<Task> = table
+            .iter()?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|(_, v)| serde_json::from_slice(v.value()).ok())
+            .collect();
+        Ok(tasks)
     }
 
     /// Assigns real keys to any tasks that predate the `key` field (which default
     /// to 0 via serde), so they don't all collide on the same display key.
     fn backfill_keys(&self) -> Result<()> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(TABLE)?;
-        let mut unkeyed: Vec<Task> = table
-            .iter()?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|(_, v)| serde_json::from_slice::<Task>(v.value()).ok())
-            .filter(|t| t.key == 0)
-            .collect();
-        drop(table);
-        drop(read_txn);
-
+        let mut unkeyed: Vec<Task> = self.all_tasks()?.into_iter().filter(|t| t.key == 0).collect();
         if unkeyed.is_empty() {
             return Ok(());
         }
@@ -56,6 +82,36 @@ impl RedbStore {
             task.key = start + offset as u32;
             self.put(&task)?;
         }
+        Ok(())
+    }
+
+    /// Old pillar values were serialized from a fixed enum (`"Mind"`, `"Body"`, ...).
+    /// Profile-defined pillar names are lowercase by convention; this brings any
+    /// legacy-cased value in line so name matching stays consistent.
+    fn normalize_pillars(&self) -> Result<()> {
+        let stale: Vec<Task> = self
+            .all_tasks()?
+            .into_iter()
+            .filter(|t| t.pillar.as_deref().is_some_and(|p| p != p.to_lowercase()))
+            .collect();
+        for mut task in stale {
+            task.pillar = task.pillar.map(|p| p.to_lowercase());
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    /// Ensures a fresh store always has a usable active profile, so existing
+    /// pillar commands keep working immediately after upgrading with no manual
+    /// setup step.
+    fn bootstrap_default_profile(&self) -> Result<()> {
+        if !self.list_profiles()?.is_empty() {
+            return Ok(());
+        }
+        let profile = Profile::default_personal();
+        let name = profile.name.clone();
+        self.add_profile(profile)?;
+        self.use_profile(&name)?;
         Ok(())
     }
 
@@ -71,15 +127,8 @@ impl RedbStore {
     }
 
     fn list_where(&self, archived: bool) -> Result<Vec<Task>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(TABLE)?;
-        let mut tasks: Vec<Task> = table
-            .iter()?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|(_, v)| serde_json::from_slice(v.value()).ok())
-            .filter(|t: &Task| t.archived == archived)
-            .collect();
-        tasks.sort_by_key(|t: &Task| t.id);
+        let mut tasks: Vec<Task> = self.all_tasks()?.into_iter().filter(|t| t.archived == archived).collect();
+        tasks.sort_by_key(|t| t.id);
         Ok(tasks)
     }
 
@@ -93,15 +142,7 @@ impl RedbStore {
     }
 
     fn next_key(&self) -> Result<u32> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(TABLE)?;
-        let max = table
-            .iter()?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|(_, v)| serde_json::from_slice::<Task>(v.value()).ok())
-            .map(|t| t.key)
-            .max()
-            .unwrap_or(0);
+        let max = self.all_tasks()?.into_iter().map(|t| t.key).max().unwrap_or(0);
         Ok(max + 1)
     }
 }
@@ -115,12 +156,57 @@ impl Store for RedbStore {
         Ok(task)
     }
 
+    fn spawn_child(&self, parent_key: u32, title: String, description: String, tags: Vec<String>) -> Result<Task> {
+        let all = self.all_tasks()?;
+        if !all.iter().any(|t| t.key == parent_key) {
+            bail!("no task with key WAY-{parent_key}");
+        }
+        let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let key = self.next_key()?;
+        let mut task = Task::new(id, key, title, description, tags);
+        task.parent_key = Some(parent_key);
+        self.put(&task)?;
+        Ok(task)
+    }
+
     fn list(&self) -> Result<Vec<Task>> {
         self.list_where(false)
     }
 
     fn list_archived(&self) -> Result<Vec<Task>> {
         self.list_where(true)
+    }
+
+    fn find_by_key(&self, key: u32) -> Result<Option<Task>> {
+        Ok(self.all_tasks()?.into_iter().find(|t| t.key == key))
+    }
+
+    fn tree(&self, key: u32) -> Result<TaskTree> {
+        let all = self.all_tasks()?;
+        let task = all.iter().find(|t| t.key == key).cloned().ok_or_else(|| anyhow!("no task with key WAY-{key}"))?;
+
+        let mut ancestors = Vec::new();
+        let mut current = task.parent_key;
+        while let Some(pk) = current {
+            match all.iter().find(|t| t.key == pk) {
+                Some(parent) => {
+                    current = parent.parent_key;
+                    ancestors.push(parent.clone());
+                }
+                None => break,
+            }
+        }
+
+        fn collect_descendants(all: &[Task], parent_key: u32, out: &mut Vec<Task>) {
+            for t in all.iter().filter(|t| t.parent_key == Some(parent_key)) {
+                out.push(t.clone());
+                collect_descendants(all, t.key, out);
+            }
+        }
+        let mut descendants = Vec::new();
+        collect_descendants(&all, key, &mut descendants);
+
+        Ok(TaskTree { task, ancestors, descendants })
     }
 
     fn toggle(&self, id: u64) -> Result<()> {
@@ -157,11 +243,96 @@ impl Store for RedbStore {
         Ok(())
     }
 
-    fn set_pillar(&self, id: u64, pillar: Option<Pillar>) -> Result<()> {
+    fn set_pillar(&self, id: u64, pillar: Option<String>) -> Result<()> {
+        let pillar = match pillar {
+            Some(name) => {
+                let profile = self.active_profile()?;
+                let def = profile
+                    .find_pillar(&name)
+                    .ok_or_else(|| anyhow!("unknown pillar '{name}' for active profile '{}'", profile.name))?;
+                Some(def.name.clone())
+            }
+            None => None,
+        };
         if let Some(mut task) = self.get(id)? {
             task.pillar = pillar;
             self.put(&task)?;
         }
+        Ok(())
+    }
+
+    fn link_external(&self, id: u64, external_ref: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.external_ref = external_ref;
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn set_session_state(&self, id: u64, state: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.session_state = state;
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn list_profiles(&self) -> Result<Vec<Profile>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(PROFILES_TABLE)?;
+        let mut profiles: Vec<Profile> = table
+            .iter()?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|(_, v)| serde_json::from_slice(v.value()).ok())
+            .collect();
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(profiles)
+    }
+
+    fn active_profile(&self) -> Result<Profile> {
+        let read_txn = self.db.begin_read()?;
+        let settings = read_txn.open_table(SETTINGS_TABLE)?;
+        let name = settings
+            .get(ACTIVE_PROFILE_KEY)?
+            .map(|v| v.value().to_string())
+            .ok_or_else(|| anyhow!("no active profile set"))?;
+        let profiles = read_txn.open_table(PROFILES_TABLE)?;
+        let bytes = profiles.get(name.as_str())?.ok_or_else(|| anyhow!("active profile '{name}' not found"))?;
+        Ok(serde_json::from_slice(bytes.value())?)
+    }
+
+    fn use_profile(&self, name: &str) -> Result<()> {
+        {
+            let read_txn = self.db.begin_read()?;
+            let profiles = read_txn.open_table(PROFILES_TABLE)?;
+            if profiles.get(name)?.is_none() {
+                bail!("no profile named '{name}'");
+            }
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut settings = write_txn.open_table(SETTINGS_TABLE)?;
+            settings.insert(ACTIVE_PROFILE_KEY, name)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn add_profile(&self, profile: Profile) -> Result<()> {
+        {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(PROFILES_TABLE)?;
+            if table.get(profile.name.as_str())?.is_some() {
+                bail!("profile '{}' already exists", profile.name);
+            }
+        }
+        let bytes = serde_json::to_vec(&profile)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PROFILES_TABLE)?;
+            table.insert(profile.name.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 }
@@ -170,49 +341,50 @@ impl Store for RedbStore {
 mod tests {
     use super::*;
 
+    fn temp_path(label: &str) -> String {
+        std::env::temp_dir().join(format!("way-store-test-{label}-{}.redb", std::process::id())).to_str().unwrap().to_string()
+    }
+
     #[test]
     fn survives_reopen() {
-        let path = std::env::temp_dir().join(format!("way-store-test-{}.redb", std::process::id()));
-        let path = path.to_str().unwrap();
-        let _ = std::fs::remove_file(path);
+        let path = temp_path("survives-reopen");
+        let _ = std::fs::remove_file(&path);
 
         {
-            let store = RedbStore::open(path).unwrap();
+            let store = RedbStore::open(&path).unwrap();
             store.add("survives a restart".to_string(), String::new(), vec![]).unwrap();
         } // store (and its Database handle) dropped here, exactly like process exit
 
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(&path).unwrap();
         let tasks = store.list().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "survives a restart");
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn old_records_without_pillar_still_deserialize() {
-        let path = std::env::temp_dir().join(format!("way-store-test-pillar-{}.redb", std::process::id()));
-        let path = path.to_str().unwrap();
-        let _ = std::fs::remove_file(path);
+        let path = temp_path("no-pillar");
+        let _ = std::fs::remove_file(&path);
 
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(&path).unwrap();
         let task = store.add("assign me".to_string(), String::new(), vec![]).unwrap();
         assert_eq!(task.pillar, None);
 
-        store.set_pillar(task.id, Some(Pillar::Craft)).unwrap();
+        store.set_pillar(task.id, Some("craft".to_string())).unwrap();
         let tasks = store.list().unwrap();
-        assert_eq!(tasks[0].pillar, Some(Pillar::Craft));
+        assert_eq!(tasks[0].pillar, Some("craft".to_string()));
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn keys_increment_and_are_never_reused() {
-        let path = std::env::temp_dir().join(format!("way-store-test-keys-{}.redb", std::process::id()));
-        let path = path.to_str().unwrap();
-        let _ = std::fs::remove_file(path);
+        let path = temp_path("keys");
+        let _ = std::fs::remove_file(&path);
 
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(&path).unwrap();
         let t1 = store.add("one".to_string(), String::new(), vec![]).unwrap();
         let t2 = store.add("two".to_string(), String::new(), vec![]).unwrap();
         assert_eq!(t1.key, 1);
@@ -222,17 +394,16 @@ mod tests {
         let t3 = store.add("three".to_string(), String::new(), vec![]).unwrap();
         assert_eq!(t3.key, 3, "key should not be reused after archiving t1");
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn backfills_missing_keys_on_open() {
-        let path = std::env::temp_dir().join(format!("way-store-test-backfill-{}.redb", std::process::id()));
-        let path = path.to_str().unwrap();
-        let _ = std::fs::remove_file(path);
+        let path = temp_path("backfill");
+        let _ = std::fs::remove_file(&path);
 
         {
-            let store = RedbStore::open(path).unwrap();
+            let store = RedbStore::open(&path).unwrap();
             // Simulate legacy records that predate the key field (key defaults to 0).
             let mut a = store.add("first".to_string(), String::new(), vec![]).unwrap();
             a.key = 0;
@@ -242,12 +413,121 @@ mod tests {
             store.put(&b).unwrap();
         }
 
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(&path).unwrap();
         let keys: Vec<u32> = store.list().unwrap().iter().map(|t| t.key).collect();
         assert_eq!(keys.len(), 2);
         assert!(keys.iter().all(|k| *k != 0), "backfilled tasks must not stay at key 0");
         assert_ne!(keys[0], keys[1], "backfilled keys must be unique, not both WAY-0");
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pillar_migration_normalizes_legacy_capitalized_values() {
+        let path = temp_path("normalize");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = RedbStore::open(&path).unwrap();
+            let mut task = store.add("legacy".to_string(), String::new(), vec![]).unwrap();
+            task.pillar = Some("Mind".to_string()); // simulates the old fixed-enum serialization
+            store.put(&task).unwrap();
+        }
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.find_by_key(1).unwrap().unwrap();
+        assert_eq!(task.pillar, Some("mind".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fresh_store_bootstraps_default_personal_profile() {
+        let path = temp_path("bootstrap");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let profiles = store.list_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "personal");
+        assert_eq!(profiles[0].pillars.len(), 6);
+
+        let active = store.active_profile().unwrap();
+        assert_eq!(active.name, "personal");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn spawn_creates_linked_child_and_rejects_unknown_parent() {
+        let path = temp_path("spawn");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let parent = store.add("spike".to_string(), String::new(), vec![]).unwrap();
+        let child = store.spawn_child(parent.key, "prd".to_string(), String::new(), vec![]).unwrap();
+        assert_eq!(child.parent_key, Some(parent.key));
+
+        let err = store.spawn_child(9999, "orphan".to_string(), String::new(), vec![]);
+        assert!(err.is_err());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn tree_returns_full_ancestor_chain_and_descendants() {
+        let path = temp_path("tree");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let spike = store.add("spike".to_string(), String::new(), vec![]).unwrap();
+        let prd = store.spawn_child(spike.key, "prd".to_string(), String::new(), vec![]).unwrap();
+        let ticket = store.spawn_child(prd.key, "ticket".to_string(), String::new(), vec![]).unwrap();
+
+        let tree = store.tree(prd.key).unwrap();
+        assert_eq!(tree.task.key, prd.key);
+        assert_eq!(tree.ancestors.len(), 1);
+        assert_eq!(tree.ancestors[0].key, spike.key);
+        assert_eq!(tree.descendants.len(), 1);
+        assert_eq!(tree.descendants[0].key, ticket.key);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn session_state_round_trips_and_clears() {
+        let path = temp_path("session");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("has a session".to_string(), String::new(), vec![]).unwrap();
+        store.set_session_state(task.id, Some("phase: grounding\nnext: draft prd".to_string())).unwrap();
+
+        let reloaded = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(reloaded.session_state, Some("phase: grounding\nnext: draft prd".to_string()));
+
+        store.set_session_state(task.id, None).unwrap();
+        let cleared = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(cleared.session_state, None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pillar_assignment_rejects_name_not_in_active_profile() {
+        let path = temp_path("pillarcheck");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("needs a pillar".to_string(), String::new(), vec![]).unwrap();
+
+        let err = store.set_pillar(task.id, Some("not-a-real-pillar".to_string()));
+        assert!(err.is_err());
+
+        store.set_pillar(task.id, Some("craft".to_string())).unwrap();
+        let reloaded = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(reloaded.pillar, Some("craft".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -1,8 +1,10 @@
+use std::io::Read;
+
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::store::Store;
-use crate::task::{Pillar, Task};
+use crate::task::{PillarDef, Profile};
 
 #[derive(Parser)]
 #[command(name = "way", about = "way: a life task tracker")]
@@ -21,7 +23,18 @@ pub enum Command {
         /// Comma-separated tags
         #[arg(long)]
         tags: Option<String>,
-        /// mind, body, relationships, craft, stability, or purpose
+        /// Must be a pillar name in the active profile
+        #[arg(long)]
+        pillar: Option<String>,
+    },
+    /// Create a task as a child of an existing task (lineage)
+    Spawn {
+        parent_key: u32,
+        title: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        tags: Option<String>,
         #[arg(long)]
         pillar: Option<String>,
     },
@@ -36,10 +49,48 @@ pub enum Command {
     },
     /// Show one task by its WAY-N key
     Show { key: u32 },
+    /// Show a task's full lineage: ancestors and descendants
+    Tree { key: u32 },
     /// Mark a task done (idempotent)
     Done { key: u32 },
     /// Set a task's pillar, or "clear" to unset it
     Pillar { key: u32, pillar: String },
+    /// Attach an external issue reference (GH Discussion / Linear id), or "clear" to unset it
+    Link { key: u32, external_ref: String },
+    /// Read/write a task's session resume-state
+    Session {
+        #[command(subcommand)]
+        action: SessionCommand,
+    },
+    /// Manage profiles (each with its own configurable pillar set)
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Read the resume-state blob from stdin and store it
+    Set { key: u32 },
+    /// Print the raw resume-state blob to stdout
+    Show { key: u32 },
+    /// Clear the resume-state
+    Clear { key: u32 },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileCommand {
+    /// List all profiles
+    List,
+    /// Switch the active profile
+    Use { name: String },
+    /// Create a new profile. --pillars is "name:glyph:colorhex,name:glyph:colorhex,..."
+    Add {
+        name: String,
+        #[arg(long)]
+        pillars: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -55,35 +106,53 @@ pub enum ViewFilter {
     Archived,
 }
 
-fn parse_pillar(s: &str) -> Result<Pillar> {
-    match s.to_lowercase().as_str() {
-        "mind" => Ok(Pillar::Mind),
-        "body" => Ok(Pillar::Body),
-        "relationships" => Ok(Pillar::Relationships),
-        "craft" => Ok(Pillar::Craft),
-        "stability" => Ok(Pillar::Stability),
-        "purpose" => Ok(Pillar::Purpose),
-        other => bail!("unknown pillar '{other}' (expected mind/body/relationships/craft/stability/purpose)"),
-    }
+fn is_clear(s: &str) -> bool {
+    s.eq_ignore_ascii_case("clear") || s.eq_ignore_ascii_case("none")
 }
 
-fn find_by_key(store: &dyn Store, key: u32) -> Result<Task> {
-    let mut tasks = store.list()?;
-    tasks.extend(store.list_archived()?);
-    tasks.into_iter().find(|t| t.key == key).ok_or_else(|| anyhow!("no task with key WAY-{key}"))
+fn find_by_key(store: &dyn Store, key: u32) -> Result<crate::task::Task> {
+    store.find_by_key(key)?.ok_or_else(|| anyhow!("no task with key WAY-{key}"))
+}
+
+fn parse_pillar_spec(spec: &str) -> Result<Vec<PillarDef>> {
+    spec.split(',')
+        .map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            let [name, glyph, color] = parts.as_slice() else {
+                bail!("invalid pillar spec '{entry}' (expected name:glyph:colorhex)");
+            };
+            if glyph.chars().count() != 1 {
+                bail!("pillar glyph '{glyph}' must be exactly one character");
+            }
+            let hex = color.trim_start_matches('#');
+            if hex.len() != 6 {
+                bail!("pillar color '{color}' must be a 6-digit hex value");
+            }
+            let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| anyhow!("invalid hex color '{color}'"))?;
+            let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| anyhow!("invalid hex color '{color}'"))?;
+            let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| anyhow!("invalid hex color '{color}'"))?;
+            Ok(PillarDef { name: name.to_lowercase(), glyph: glyph.to_string(), color: (r, g, b) })
+        })
+        .collect()
 }
 
 pub fn run(command: Command, store: &dyn Store) -> Result<()> {
     match command {
         Command::Add { title, description, tags, pillar } => {
-            let tags = tags
-                .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default();
+            let tags = split_tags(tags);
             let mut task = store.add(title, description.unwrap_or_default(), tags)?;
             if let Some(p) = pillar {
-                let p = parse_pillar(&p)?;
-                store.set_pillar(task.id, Some(p))?;
-                task.pillar = Some(p);
+                store.set_pillar(task.id, Some(p.clone()))?;
+                task.pillar = Some(p.to_lowercase());
+            }
+            println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        Command::Spawn { parent_key, title, description, tags, pillar } => {
+            let tags = split_tags(tags);
+            let mut task = store.spawn_child(parent_key, title, description.unwrap_or_default(), tags)?;
+            if let Some(p) = pillar {
+                store.set_pillar(task.id, Some(p.clone()))?;
+                task.pillar = Some(p.to_lowercase());
             }
             println!("{}", serde_json::to_string_pretty(&task)?);
         }
@@ -93,8 +162,8 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
                 ViewFilter::Archived => store.list_archived()?,
             };
             if let Some(p) = pillar {
-                let p = parse_pillar(&p)?;
-                tasks.retain(|t| t.pillar == Some(p));
+                let p = p.to_lowercase();
+                tasks.retain(|t| t.pillar.as_deref() == Some(p.as_str()));
             }
             tasks.retain(|t| match status {
                 StatusFilter::All => true,
@@ -107,6 +176,10 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
             let task = find_by_key(store, key)?;
             println!("{}", serde_json::to_string_pretty(&task)?);
         }
+        Command::Tree { key } => {
+            let tree = store.tree(key)?;
+            println!("{}", serde_json::to_string_pretty(&tree)?);
+        }
         Command::Done { key } => {
             let mut task = find_by_key(store, key)?;
             if !task.done {
@@ -117,15 +190,63 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
         }
         Command::Pillar { key, pillar } => {
             let mut task = find_by_key(store, key)?;
-            let p = if pillar.eq_ignore_ascii_case("clear") || pillar.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(parse_pillar(&pillar)?)
-            };
-            store.set_pillar(task.id, p)?;
-            task.pillar = p;
+            let p = if is_clear(&pillar) { None } else { Some(pillar) };
+            store.set_pillar(task.id, p.clone())?;
+            task.pillar = p.map(|p| p.to_lowercase());
             println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        Command::Link { key, external_ref } => {
+            let mut task = find_by_key(store, key)?;
+            let r = if is_clear(&external_ref) { None } else { Some(external_ref) };
+            store.link_external(task.id, r.clone())?;
+            task.external_ref = r;
+            println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        Command::Session { action } => run_session(action, store)?,
+        Command::Profile { action } => run_profile(action, store)?,
+    }
+    Ok(())
+}
+
+fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
+    match action {
+        SessionCommand::Set { key } => {
+            let task = find_by_key(store, key)?;
+            let mut blob = String::new();
+            std::io::stdin().read_to_string(&mut blob)?;
+            store.set_session_state(task.id, Some(blob))?;
+        }
+        SessionCommand::Show { key } => {
+            let task = find_by_key(store, key)?;
+            match task.session_state {
+                Some(state) => println!("{state}"),
+                None => bail!("no session state for WAY-{key}"),
+            }
+        }
+        SessionCommand::Clear { key } => {
+            let task = find_by_key(store, key)?;
+            store.set_session_state(task.id, None)?;
         }
     }
     Ok(())
+}
+
+fn run_profile(action: ProfileCommand, store: &dyn Store) -> Result<()> {
+    match action {
+        ProfileCommand::List => {
+            println!("{}", serde_json::to_string_pretty(&store.list_profiles()?)?);
+        }
+        ProfileCommand::Use { name } => {
+            store.use_profile(&name)?;
+        }
+        ProfileCommand::Add { name, pillars } => {
+            let pillars = parse_pillar_spec(&pillars)?;
+            store.add_profile(Profile { name, pillars, default_issue_system: None })?;
+        }
+    }
+    Ok(())
+}
+
+fn split_tags(tags: Option<String>) -> Vec<String> {
+    tags.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
 }

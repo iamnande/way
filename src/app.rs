@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 
 use crate::store::Store;
-use crate::task::{Pillar, Task};
+use crate::task::{Profile, Task};
 
 fn text_editor(initial: &str) -> EditorState {
     let mut state = EditorState::new(Lines::from(initial));
@@ -62,6 +62,7 @@ pub struct App {
     pub selected: usize,
     pub mode: Mode,
     pub view: View,
+    pub active_profile: Profile,
     pub title_editor: EditorState,
     pub description_editor: EditorState,
     pub draft_tags: Vec<String>,
@@ -69,17 +70,20 @@ pub struct App {
     editor_events: EditorEventHandler,
     editing_id: Option<u64>,
     pub should_quit: bool,
+    pub pending_spawn: Option<u32>,
 }
 
 impl App {
     pub fn new(store: Box<dyn Store>) -> Result<Self> {
         let tasks = store.list()?;
+        let active_profile = store.active_profile()?;
         Ok(Self {
             store,
             tasks,
             selected: 0,
             mode: Mode::Normal,
             view: View::Active,
+            active_profile,
             title_editor: text_editor(""),
             description_editor: text_editor(""),
             draft_tags: Vec::new(),
@@ -87,6 +91,7 @@ impl App {
             editor_events: EditorEventHandler::emacs_mode(),
             editing_id: None,
             should_quit: false,
+            pending_spawn: None,
         })
     }
 
@@ -148,6 +153,11 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char(' ') | KeyCode::Enter if self.view == View::Active => {
                 self.toggle_selected()?;
             }
+            KeyCode::Char('c') => {
+                if let Some(task) = self.tasks.get(self.selected) {
+                    self.pending_spawn = Some(task.key);
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.selected + 1 < self.tasks.len() {
                     self.selected += 1;
@@ -203,23 +213,24 @@ impl App {
     }
 
     fn on_key_pillar_pick(&mut self, key: KeyCode) -> Result<()> {
-        let selection: Option<Pillar> = match key {
-            KeyCode::Char('1') => Some(Pillar::Mind),
-            KeyCode::Char('2') => Some(Pillar::Body),
-            KeyCode::Char('3') => Some(Pillar::Relationships),
-            KeyCode::Char('4') => Some(Pillar::Craft),
-            KeyCode::Char('5') => Some(Pillar::Stability),
-            KeyCode::Char('6') => Some(Pillar::Purpose),
-            KeyCode::Char('0') => None,
+        let count = self.active_profile.pillars.len() as u32;
+        let selection: Option<Option<String>> = match key {
+            KeyCode::Char('0') => Some(None),
+            KeyCode::Char(c) if c.to_digit(10).is_some_and(|d| (1..=count).contains(&d)) => {
+                let idx = c.to_digit(10).unwrap() as usize - 1;
+                Some(Some(self.active_profile.pillars[idx].name.clone()))
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 return Ok(());
             }
             _ => return Ok(()),
         };
-        if let Some(task) = self.tasks.get(self.selected) {
+        if let Some(pillar) = selection
+            && let Some(task) = self.tasks.get(self.selected)
+        {
             let id = task.id;
-            self.store.set_pillar(id, selection)?;
+            self.store.set_pillar(id, pillar)?;
             self.refresh()?;
         }
         self.mode = Mode::Normal;

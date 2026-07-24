@@ -7,18 +7,15 @@ use ratatui::{
 };
 
 use crate::app::{App, ConfirmKind, Field, Mode, View};
-use crate::task::Pillar;
+use crate::task::PillarDef;
 use crate::theme;
 
-fn pillar_color(pillar: Pillar) -> Color {
-    match pillar {
-        Pillar::Mind => theme::AQUA,
-        Pillar::Body => theme::GREEN,
-        Pillar::Relationships => theme::PURPLE,
-        Pillar::Craft => theme::YELLOW,
-        Pillar::Stability => theme::BLUE,
-        Pillar::Purpose => theme::RED,
-    }
+fn pillar_def_color(def: &PillarDef) -> Color {
+    Color::Rgb(def.color.0, def.color.1, def.color.2)
+}
+
+fn find_pillar_def<'a>(app: &'a App, name: &str) -> Option<&'a PillarDef> {
+    app.active_profile.pillars.iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -82,10 +79,12 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!("{mark} "), Style::default().fg(mark_color)),
             ];
             let mut prefix_len = key.chars().count() + mark.chars().count() + 1;
-            if let Some(pillar) = task.pillar {
-                let tag = format!("[{}] ", pillar.glyph());
+            if let Some(pillar) = &task.pillar
+                && let Some(def) = find_pillar_def(app, pillar)
+            {
+                let tag = format!("[{}] ", def.glyph);
                 prefix_len += tag.chars().count();
-                spans.push(Span::styled(tag, Style::default().fg(pillar_color(pillar))));
+                spans.push(Span::styled(tag, Style::default().fg(pillar_def_color(def))));
             }
 
             let title = truncate(&task.title, inner_width.saturating_sub(prefix_len));
@@ -168,8 +167,11 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         task.description.as_str()
     };
-    let (pillar_label, pillar_style) = match task.pillar {
-        Some(pillar) => (pillar.label().to_string(), Style::default().fg(pillar_color(pillar))),
+    let (pillar_label, pillar_style) = match &task.pillar {
+        Some(name) => match find_pillar_def(app, name) {
+            Some(def) => (def.name.clone(), Style::default().fg(pillar_def_color(def))),
+            None => (format!("{name} (unknown — profile changed)"), Style::default().fg(theme::DIM)),
+        },
         None => ("(unassigned — press 'p')".to_string(), Style::default().fg(theme::DIM)),
     };
 
@@ -296,8 +298,8 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
             theme::DIM,
             Line::from(Span::styled(
                 match app.view {
-                    View::Active => "a add  e edit  s status  t tags  p pillar  d archive  A archived  j/k move  q quit",
-                    View::Archived => "d restore  A active  j/k move  q quit",
+                    View::Active => "a add  e edit  s status  t tags  p pillar  c claude  d archive  A archived  j/k move  q quit",
+                    View::Archived => "c claude  d restore  A active  j/k move  q quit",
                 },
                 Style::default().fg(theme::DIM),
             )),
@@ -327,20 +329,17 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
                 )),
             )
         }
-        Mode::PillarPick => (theme::FG, pillar_pick_line()),
+        Mode::PillarPick => (theme::FG, pillar_pick_line(app)),
     };
 
     let bottom = Paragraph::new(content).block(rounded(border_color));
     frame.render_widget(bottom, area);
 }
 
-fn pillar_pick_line() -> Line<'static> {
+fn pillar_pick_line(app: &App) -> Line<'static> {
     let mut spans = Vec::new();
-    for (i, pillar) in Pillar::ALL.iter().enumerate() {
-        spans.push(Span::styled(
-            format!("{} {}  ", i + 1, pillar.label()),
-            Style::default().fg(pillar_color(*pillar)),
-        ));
+    for (i, def) in app.active_profile.pillars.iter().enumerate() {
+        spans.push(Span::styled(format!("{} {}  ", i + 1, def.name), Style::default().fg(pillar_def_color(def))));
     }
     spans.push(Span::styled("0 clear  ", Style::default().fg(theme::DIM)));
     spans.push(Span::styled("esc cancel", Style::default().fg(theme::DIM)));
