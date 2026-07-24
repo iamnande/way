@@ -70,7 +70,7 @@ pub struct App {
     editor_events: EditorEventHandler,
     editing_id: Option<u64>,
     pub should_quit: bool,
-    pub pending_spawn: Option<u32>,
+    pub pending_spawn: Option<Task>,
 }
 
 impl App {
@@ -155,7 +155,7 @@ impl App {
             }
             KeyCode::Char('c') => {
                 if let Some(task) = self.tasks.get(self.selected) {
-                    self.pending_spawn = Some(task.key);
+                    self.pending_spawn = Some(task.clone());
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {

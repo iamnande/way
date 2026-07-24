@@ -18,6 +18,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
 use store::RedbStore;
+use task::Task;
 
 fn data_path() -> Result<std::path::PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("could not resolve a data directory"))?;
@@ -59,8 +60,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             app.on_key(key.code, key.modifiers)?;
         }
 
-        if let Some(way_key) = app.pending_spawn.take() {
-            spawn_claude_session(terminal, way_key)?;
+        if let Some(task) = app.pending_spawn.take() {
+            spawn_claude_session(terminal, &task)?;
         }
 
         if app.should_quit {
@@ -70,17 +71,31 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     Ok(())
 }
 
+/// Builds the opening prompt from the task itself — context assembled by
+/// `way` before `claude` ever starts, not left for a cold session to go
+/// fetch afterward. If the task carries session-state (a prior senzu
+/// compact), this is a re-attach: the stored resume-state is handed over
+/// verbatim, opaque to `way`, so the session picks up where it left off
+/// instead of re-grounding from zero.
+fn build_prompt(task: &Task) -> String {
+    if let Some(state) = &task.session_state {
+        return format!("Resuming WAY-{}: {}\n\nPrior session state:\n{}\n\nContinue from here.", task.key, task.title, state);
+    }
+
+    let description = if task.description.is_empty() { "(no description)".to_string() } else { task.description.clone() };
+    let tags = if task.tags.is_empty() { "(none)".to_string() } else { task.tags.join(", ") };
+    let pillar = task.pillar.as_deref().unwrap_or("(unassigned)");
+    format!("Starting WAY-{}: {}\n\n{description}\n\ntags: {tags}\npillar: {pillar}", task.key, task.title)
+}
+
 /// Suspends the TUI, hands the real terminal to a `claude` subprocess seeded
-/// with just the task's WAY-N key, waits for it to exit, then restores the
-/// TUI. Deliberately minimal — the session is expected to pull full context
-/// itself via `way show`/`way session show`, not have it injected here.
-fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, key: u32) -> Result<()> {
+/// with the assembled prompt, waits for it to exit, then restores the TUI.
+fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, task: &Task) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    let prompt = format!("let's work on WAY-{key} — run `way show {key}` for context");
-    let result = std::process::Command::new("claude").arg(prompt).status();
+    let result = std::process::Command::new("claude").arg(build_prompt(task)).status();
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
