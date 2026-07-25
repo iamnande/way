@@ -61,7 +61,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if let Some(task) = app.pending_spawn.take() {
-            spawn_claude_session(terminal, &task, app.claude_launch_args.as_deref())?;
+            let launch_args = app.claude_launch_args()?;
+            spawn_claude_session(terminal, &task, launch_args.as_deref())?;
         }
 
         if app.should_quit {
