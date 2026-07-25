@@ -75,6 +75,25 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
+    /// Operator-level settings for how way itself behaves
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Extra args passed to `claude` when the TUI spawns a session
+    /// (e.g. "--dangerously-skip-permissions"). Space-separated, no quoting support.
+    SetClaudeArgs {
+        #[arg(allow_hyphen_values = true)]
+        args: String,
+    },
+    /// Show current config
+    Show,
+    /// Clear the claude launch args
+    ClearClaudeArgs,
 }
 
 #[derive(Subcommand)]
@@ -219,6 +238,23 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
         }
         Command::Session { action } => run_session(action, store)?,
         Command::Profile { action } => run_profile(action, store)?,
+        Command::Config { action } => run_config(action, store)?,
+    }
+    Ok(())
+}
+
+fn run_config(action: ConfigCommand, store: &dyn Store) -> Result<()> {
+    match action {
+        ConfigCommand::SetClaudeArgs { args } => {
+            store.set_claude_launch_args(Some(args))?;
+        }
+        ConfigCommand::Show => {
+            let args = store.claude_launch_args()?;
+            println!("claude_launch_args: {}", args.as_deref().unwrap_or("(none)"));
+        }
+        ConfigCommand::ClearClaudeArgs => {
+            store.set_claude_launch_args(None)?;
+        }
     }
     Ok(())
 }

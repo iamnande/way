@@ -63,6 +63,7 @@ pub struct App {
     pub mode: Mode,
     pub view: View,
     pub active_profile: Profile,
+    pub claude_launch_args: Option<String>,
     pub title_editor: EditorState,
     pub description_editor: EditorState,
     pub draft_tags: Vec<String>,
@@ -77,6 +78,7 @@ impl App {
     pub fn new(store: Box<dyn Store>) -> Result<Self> {
         let tasks = store.list()?;
         let active_profile = store.active_profile()?;
+        let claude_launch_args = store.claude_launch_args()?;
         Ok(Self {
             store,
             tasks,
@@ -84,6 +86,7 @@ impl App {
             mode: Mode::Normal,
             view: View::Active,
             active_profile,
+            claude_launch_args,
             title_editor: text_editor(""),
             description_editor: text_editor(""),
             draft_tags: Vec::new(),

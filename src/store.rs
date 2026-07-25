@@ -10,6 +10,7 @@ const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tasks");
 const PROFILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("profiles");
 const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settings");
 const ACTIVE_PROFILE_KEY: &str = "active_profile";
+const CLAUDE_LAUNCH_ARGS_KEY: &str = "claude_launch_args";
 
 fn now_unix() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
@@ -44,6 +45,8 @@ pub trait Store {
     fn active_profile(&self) -> Result<Profile>;
     fn use_profile(&self, name: &str) -> Result<()>;
     fn add_profile(&self, profile: Profile) -> Result<()>;
+    fn claude_launch_args(&self) -> Result<Option<String>>;
+    fn set_claude_launch_args(&self, args: Option<String>) -> Result<()>;
 }
 
 pub struct RedbStore {
@@ -384,6 +387,29 @@ impl Store for RedbStore {
         write_txn.commit()?;
         Ok(())
     }
+
+    fn claude_launch_args(&self) -> Result<Option<String>> {
+        let read_txn = self.db.begin_read()?;
+        let settings = read_txn.open_table(SETTINGS_TABLE)?;
+        Ok(settings.get(CLAUDE_LAUNCH_ARGS_KEY)?.map(|v| v.value().to_string()))
+    }
+
+    fn set_claude_launch_args(&self, args: Option<String>) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut settings = write_txn.open_table(SETTINGS_TABLE)?;
+            match args {
+                Some(a) => {
+                    settings.insert(CLAUDE_LAUNCH_ARGS_KEY, a.as_str())?;
+                }
+                None => {
+                    settings.remove(CLAUDE_LAUNCH_ARGS_KEY)?;
+                }
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +638,23 @@ mod tests {
         store.set_pillar(task.id, Some("craft".to_string())).unwrap();
         let reloaded = store.find_by_key(task.key).unwrap().unwrap();
         assert_eq!(reloaded.pillar, Some("craft".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn claude_launch_args_round_trip_and_clear() {
+        let path = temp_path("launch-args");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(store.claude_launch_args().unwrap(), None);
+
+        store.set_claude_launch_args(Some("--dangerously-skip-permissions".to_string())).unwrap();
+        assert_eq!(store.claude_launch_args().unwrap(), Some("--dangerously-skip-permissions".to_string()));
+
+        store.set_claude_launch_args(None).unwrap();
+        assert_eq!(store.claude_launch_args().unwrap(), None);
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -61,7 +61,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if let Some(task) = app.pending_spawn.take() {
-            spawn_claude_session(terminal, &task)?;
+            spawn_claude_session(terminal, &task, app.claude_launch_args.as_deref())?;
         }
 
         if app.should_quit {
@@ -98,12 +98,24 @@ fn build_prompt(task: &Task) -> String {
 
 /// Suspends the TUI, hands the real terminal to a `claude` subprocess seeded
 /// with the assembled prompt, waits for it to exit, then restores the TUI.
-fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, task: &Task) -> Result<()> {
+/// `launch_args` (from `way config set-claude-args`, e.g.
+/// "--dangerously-skip-permissions") is split on whitespace and passed ahead
+/// of the prompt — no quoting support, this is meant for simple flags.
+fn spawn_claude_session(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    task: &Task,
+    launch_args: Option<&str>,
+) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    let result = std::process::Command::new("claude").arg(build_prompt(task)).status();
+    let mut cmd = std::process::Command::new("claude");
+    if let Some(args) = launch_args {
+        cmd.args(args.split_whitespace());
+    }
+    cmd.arg(build_prompt(task));
+    let result = cmd.status();
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
