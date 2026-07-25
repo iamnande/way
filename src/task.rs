@@ -117,6 +117,11 @@ pub struct Task {
     pub session_next: Option<String>,
     #[serde(default)]
     pub session_updated_at: Option<i64>,
+    /// The claude CLI session UUID last used for this task, if any. Lets `way`
+    /// resume the actual conversation (`claude --resume <id>`) instead of
+    /// starting a disconnected new one seeded only with a text summary.
+    #[serde(default)]
+    pub claude_session_id: Option<String>,
 }
 
 impl Task {
@@ -135,6 +140,7 @@ impl Task {
             session_decisions: None,
             session_next: None,
             session_updated_at: None,
+            claude_session_id: None,
         }
     }
 }

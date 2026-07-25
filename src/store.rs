@@ -47,6 +47,7 @@ pub trait Store {
     fn add_profile(&self, profile: Profile) -> Result<()>;
     fn claude_launch_args(&self) -> Result<Option<String>>;
     fn set_claude_launch_args(&self, args: Option<String>) -> Result<()>;
+    fn set_claude_session_id(&self, id: u64, session_id: Option<String>) -> Result<()>;
 }
 
 pub struct RedbStore {
@@ -410,6 +411,14 @@ impl Store for RedbStore {
         write_txn.commit()?;
         Ok(())
     }
+
+    fn set_claude_session_id(&self, id: u64, session_id: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.claude_session_id = session_id;
+            self.put(&task)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +664,25 @@ mod tests {
 
         store.set_claude_launch_args(None).unwrap();
         assert_eq!(store.claude_launch_args().unwrap(), None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn claude_session_id_persists_across_reopen() {
+        let path = temp_path("session-id");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = RedbStore::open(&path).unwrap();
+            let task = store.add("resumable task".to_string(), String::new(), vec![]).unwrap();
+            assert_eq!(task.claude_session_id, None);
+            store.set_claude_session_id(task.id, Some("11111111-1111-1111-1111-111111111111".to_string())).unwrap();
+        }
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.find_by_key(1).unwrap().unwrap();
+        assert_eq!(task.claude_session_id, Some("11111111-1111-1111-1111-111111111111".to_string()));
 
         std::fs::remove_file(&path).unwrap();
     }

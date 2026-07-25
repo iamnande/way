@@ -1778,6 +1778,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

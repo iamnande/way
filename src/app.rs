@@ -95,7 +95,7 @@ impl App {
         })
     }
 
-    fn refresh(&mut self) -> Result<()> {
+    pub fn refresh(&mut self) -> Result<()> {
         self.tasks = match self.view {
             View::Active => self.store.list()?,
             View::Archived => self.store.list_archived()?,
@@ -324,5 +324,9 @@ impl App {
     /// live-reload; just don't cache something used once per keypress.
     pub fn claude_launch_args(&self) -> Result<Option<String>> {
         self.store.claude_launch_args()
+    }
+
+    pub fn set_claude_session_id(&self, task_id: u64, session_id: Option<String>) -> Result<()> {
+        self.store.set_claude_session_id(task_id, session_id)
     }
 }

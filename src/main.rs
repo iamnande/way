@@ -15,6 +15,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use uuid::Uuid;
 
 use app::App;
 use store::RedbStore;
@@ -61,8 +62,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if let Some(task) = app.pending_spawn.take() {
-            let launch_args = app.claude_launch_args()?;
-            spawn_claude_session(terminal, &task, launch_args.as_deref())?;
+            spawn_claude_session(terminal, app, &task)?;
+            app.refresh()?;
         }
 
         if app.should_quit {
@@ -97,26 +98,40 @@ fn build_prompt(task: &Task) -> String {
     format!("Starting WAY-{}: {}\n\n{description}\n\ntags: {tags}\npillar: {pillar}\nexternal refs: {refs}", task.key, task.title)
 }
 
-/// Suspends the TUI, hands the real terminal to a `claude` subprocess seeded
-/// with the assembled prompt, waits for it to exit, then restores the TUI.
+/// Suspends the TUI, hands the real terminal to a `claude` subprocess, waits
+/// for it to exit, then restores the TUI. If the task already has a
+/// `claude_session_id` (a prior spawn from `way`), this is a true resume —
+/// `claude --resume <id>` drops back into the exact same conversation, no
+/// injected prompt, matching what "re-attach" is actually supposed to mean.
+/// Otherwise a fresh session is pinned to a new UUID via `--session-id` (so
+/// it can be resumed next time) and seeded with the assembled prompt.
 /// `launch_args` (from `way config set-claude-args`, e.g.
-/// "--dangerously-skip-permissions") is split on whitespace and passed ahead
-/// of the prompt — no quoting support, this is meant for simple flags.
-fn spawn_claude_session(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    task: &Task,
-    launch_args: Option<&str>,
-) -> Result<()> {
+/// "--dangerously-skip-permissions") is split on whitespace and applied
+/// either way — no quoting support, this is meant for simple flags.
+fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, task: &Task) -> Result<()> {
+    let launch_args = app.claude_launch_args()?;
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     let mut cmd = std::process::Command::new("claude");
-    if let Some(args) = launch_args {
+    if let Some(args) = &launch_args {
         cmd.args(args.split_whitespace());
     }
-    cmd.arg(build_prompt(task));
-    let result = cmd.status();
+
+    let result = match &task.claude_session_id {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(session_id);
+            cmd.status()
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            app.set_claude_session_id(task.id, Some(new_id.clone()))?;
+            cmd.arg("--session-id").arg(&new_id).arg(build_prompt(task));
+            cmd.status()
+        }
+    };
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
