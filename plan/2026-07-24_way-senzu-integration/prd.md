@@ -21,21 +21,36 @@ different formats, on different machines.
 (add/list/show/done/pillar). It has no concept of session state, project lineage,
 multiple pillar taxonomies, or external issue linkage.
 
+**Update (post-implementation, from real-world usage feedback):** the R1
+session-state design as originally shipped — a single opaque blob, handed back
+verbatim on resume — reproduces a known failure mode: a cached "here's where we
+left off" summary that's gone stale because the work it references was
+superseded elsewhere, with nothing to catch it. The fix isn't more caching
+discipline, it's not caching the parts that have a live source of truth to
+begin with. See the updated Solution/Requirements below.
+
 ---
 
 ## Solution
 
-1. `way` tasks gain a structured session-state field (phase, decisions, completed,
-   next), written at senzu's compact checkpoints. This becomes the durable,
+1. `way` tasks gain session-state, split by whether a live source of truth
+   exists for it: lightweight `decisions`/`next` prose (way's own record — there
+   is nothing external to reconcile it against, so it's stored as-is, with an
+   `updated_at` timestamp as a passive staleness signal) plus zero or more
+   external pointers (item 4) for anything that has a live source of truth
+   elsewhere. Written at senzu's compact checkpoints, this becomes the durable,
    task-anchored source of truth for resume state, replacing `CLAUDE.local.md`'s
-   role.
+   role — without reproducing its staleness problem.
 2. `way` gains **profiles** (e.g. personal, work), each with its own independently
    configurable list of pillars, replacing the hardcoded 6-pillar enum.
 3. `way` gains **task lineage** — any task can spawn child tasks (spike → PRD →
    tickets, arbitrary depth), always as new `way` tasks, navigable as a tree.
-4. `way` tasks gain an optional **external issue link** (a GitHub Discussion or
-   Linear identifier), so senzu's existing phase-post behavior keeps posting to
-   that external thread when one is present.
+4. `way` tasks gain zero or more **external pointers** (GitHub Discussion,
+   Linear, PR, or ticket identifiers) instead of a single link. A pointer is an
+   identifier only, never a cached copy of the artifact's content — resolving it
+   live against the source system is the consuming session's job, not `way`'s
+   (see Non-Goals). senzu's existing phase-post behavior keeps posting to the
+   relevant external thread when one is present.
 5. The `way` TUI gains a keybinding to spawn a `claude` session directly from the
    selected task, handing off the terminal and seeding context from the task.
 
@@ -63,10 +78,12 @@ document defines what `way` must expose to make that follow-on work possible.
 
 - Task status: open / done (existing), archived (existing) — unchanged by this
   work.
-- **New**: a task either has no session-state, or has a stashed resume-state blob
-  (written at compact time). `way` does not itself understand or validate senzu's
-  phase model (grounding/spec/planning/.../learnings) — it stores and returns the
-  blob senzu gives it. Phase semantics stay senzu's responsibility.
+- **New**: a task carries `decisions`/`next` prose plus an `updated_at`
+  timestamp (written at compact time), and separately, zero or more external
+  pointers. `way` does not itself understand or validate senzu's phase model
+  (grounding/spec/planning/.../learnings) — it stores and returns what senzu
+  gives it. Phase semantics stay senzu's responsibility. `way` also never
+  resolves a pointer's live content itself — see Non-Goals.
 
 ---
 
@@ -74,14 +91,17 @@ document defines what `way` must expose to make that follow-on work possible.
 
 - **Before**: task creation/editing touches title, description, tags, pillar,
   status only.
-  **After**: a task can additionally carry a parent link (lineage), an external
-  issue link, and a resume-state blob. All three are optional; existing tasks and
+  **After**: a task can additionally carry a parent link (lineage), zero or more
+  external pointers, and resume-state prose. All optional; existing tasks and
   workflows are unaffected if unused.
 - **Before**: resuming a senzu session means reading `~/.claude/CLAUDE.local.md`,
   which holds at most one session's state, machine-local.
   **After**: resuming means `way show <key>`, which returns that task's own
-  resume-state — independent of machine, independent of how many other tasks also
-  have paused sessions.
+  decisions/next prose plus its external pointers — independent of machine,
+  independent of how many other tasks also have paused sessions, and without
+  presenting a stale cached copy as current: the prose is `way`'s own record
+  (nothing external to go stale against), and the pointers are resolved live by
+  whoever's resuming, not served from a cache.
 - **Before**: `way pillar <key> <name>` accepts one of 6 hardcoded values.
   **After**: accepted values depend on the active profile's configured pillar
   list.
@@ -95,10 +115,12 @@ decision, not fixed here):
 
 - `way spawn <parent-key> <title> [...]` — create a child task under a parent.
 - `way tree <key>` — show a task's full lineage (ancestors and descendants).
-- `way link <key> <external-ref>` — attach a GitHub Discussion / Linear
-  identifier to a task.
+- `way link <key> <external-ref>` — attach a pointer (GitHub Discussion, Linear,
+  PR, or ticket identifier) to a task. A task may have more than one; exact
+  add/remove/list shape is a tech-spec decision.
 - `way session set <key> <state>` / `way session show <key>` — write/read the
-  resume-state blob.
+  decisions/next prose. Pointers are read via `way link`/`way show`, not
+  bundled into this prose.
 - `way profile list` / `way profile use <name>` / `way profile add <name>
   --pillars ...` — profile management.
 - TUI: new keybinding to spawn a `claude` session from the selected task.
@@ -125,9 +147,15 @@ decision, not fixed here):
 - A task is tagged with a pillar that's later removed from its profile's
   configured list: the task keeps the stale pillar value. Not auto-migrated;
   displays as orphaned/inert data. No auto-fixup in v1.
-- A task's external link points to a GitHub Discussion / Linear issue that no
-  longer exists upstream: `way` does not validate the link at write or read
-  time. Broken links are possible and undetected.
+- A task's external pointer references a GitHub Discussion / Linear issue that
+  no longer exists upstream: `way` does not validate pointers at write or read
+  time — it never resolves them at all. Broken pointers are possible and `way`
+  itself will never detect them; detection happens (or doesn't) in whatever
+  session dereferences the pointer live.
+- A pointer can't be resolved live when a resuming session needs it (offline,
+  no `gh`/Linear auth configured): `way` isn't involved in this failure at all
+  since it never attempted resolution — this is entirely the consuming
+  session's problem to surface.
 - Circular lineage (a task's ancestor chain loops back to itself): must be
   rejected at write time by `way spawn` / `way link`-equivalent parent-setting
   logic.
@@ -151,20 +179,33 @@ infrastructure in scope. Matches existing precedent; `way` has none today.
 ## Scope & Non-Goals
 
 **in scope:**
-- Session-state field on tasks, readable/writable via the CLI
+- Session-state on tasks (decisions/next prose + `updated_at`), readable/writable via the CLI
+- Zero-or-more external pointers per task (reference only, never resolved by `way`)
 - Profiles with independently configurable per-profile pillar sets
 - Task lineage (parent/child links, always new `way` tasks, cycle-rejected)
-- External issue link field (reference only, no live validation or sync)
 - TUI → `claude` session handoff (subprocess spawn/restore)
 
 **out of scope:**
 - The senzu skill rewrite itself (separate repo, separate PRD)
 - Multi-machine sync/replication of `way`'s data store
 - Automatic pillar migration when a profile's pillar list changes
-- Live validation or bidirectional sync with GitHub Discussions/Linear
+- `way` performing live validation, resolution, or bidirectional sync against
+  GitHub Discussions/Linear itself — pointers are stored inert; dereferencing
+  them live is always the consuming session's responsibility, never `way`'s
 - Re-parenting a task's lineage after creation
 - Metrics-driven refinement (named as a future aspiration; no design exists yet)
-- Multi-user / shared access to a single `way` store
+- Committing in-flight/draft state (session prose, anything not yet promoted
+  to an external system of record) to version control, ever — this isn't a
+  deferred feature, it's a hard boundary. Keeping draft state *out* of git is
+  the actual purpose of having `way` sit next to senzu rather than folding
+  everything into commits; see Design Decisions Summary.
+- Multi-user / shared access to a single `way` store **for now.** `way` is
+  expected to grow toward multiple users sharing a set of tasks eventually
+  (long-term direction, not scheduled work) — nothing here is designed
+  specifically *for* that yet, but choices that would clearly need to be
+  undone for it (e.g. treating pointers as identifiers rather than baking in
+  single-owner assumptions) are being avoided where the cost of doing so is
+  low.
 
 ---
 
@@ -176,20 +217,27 @@ infrastructure in scope. Matches existing precedent; `way` has none today.
 | pillar model | hardcoded enum (status quo) vs. per-profile configurable list | per-profile configurable list | personal and work contexts need genuinely different taxonomies, not just a shared bucket |
 | lineage targets | tickets as external issues vs. tickets as new `way` tasks | always new `way` tasks | keeps lineage navigable locally regardless of which external system (or none) is involved |
 | active profile selection | TBD | — | open question, deferred to tech spec (see R7) |
+| session-state shape (post-implementation revision, from real-world feedback) | opaque single blob (as shipped) vs. structured decisions/next prose + separate external pointers | structured, split by whether a live source of truth exists | a cached copy of something with a live source of truth goes stale with nothing to catch it; prose with no external referent has nothing to go stale *against*, so a blob is fine there but must be separable from pointers |
+| pointer resolution ownership | `way` resolves pointers live (fetches from GH/Linear) vs. `way` stores identifiers only | identifiers only, resolution is the consuming session's job | keeps `way` free of API credentials/integration code for external systems (unchanged design principle); also means there's never a cached copy to go stale in the first place — simpler than caching-plus-verification |
+| in-flight state persistence | git-backed (reviewable like PRD/tech-spec) vs. database-only, deliberately uncommitted | database-only, never committed | committing in-flight/draft work is antithetical to `way`'s purpose — draft state needs a place to live specifically *outside* version control, not the same reviewability model as finished artifacts |
 
 ---
 
 ## Requirements
 
-- **R1:** A `way` task can store a structured session-state blob (phase,
-  decisions, completed, next), settable and readable via the CLI.
+- **R1:** A `way` task can store decisions/next resume-state prose plus an
+  `updated_at` timestamp, settable and readable via the CLI. This prose is
+  `way`'s own record and is never treated as a cached copy of something with a
+  live source of truth elsewhere.
 - **R2:** `way` supports named profiles, each with an independently configurable
   list of pillars (name, glyph, color).
 - **R3:** A `way` task can reference a parent task; creating a child task links
   it to that parent; cycles are rejected at write time.
-- **R4:** A `way` task can optionally store a free-form external issue reference
-  string (e.g. `owner/repo#N` or `PROJ-123`), with no validation against the
-  external system.
+- **R4:** A `way` task can store zero or more free-form external pointer
+  strings (e.g. `owner/repo#N` or `PROJ-123`). `way` never validates or
+  resolves them against the external system — they're stored as inert
+  identifiers; live resolution is always the consuming session's
+  responsibility.
 - **R5:** The `way` TUI can spawn a `claude` subprocess from the selected task,
   handing off the terminal and restoring the TUI cleanly on the child's exit.
 - **R6:** All existing CLI commands and TUI behavior continue to work unchanged
