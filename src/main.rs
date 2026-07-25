@@ -73,19 +73,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
 /// Builds the opening prompt from the task itself — context assembled by
 /// `way` before `claude` ever starts, not left for a cold session to go
-/// fetch afterward. If the task carries session-state (a prior senzu
-/// compact), this is a re-attach: the stored resume-state is handed over
-/// verbatim, opaque to `way`, so the session picks up where it left off
-/// instead of re-grounding from zero.
+/// fetch afterward. If the task carries decisions/next (a prior senzu
+/// compact), this is a re-attach: that prose is `way`'s own record and is
+/// handed over verbatim. External refs are listed by identifier only —
+/// `way` never cached their content, so the resuming session is told to
+/// resolve them live rather than trust anything as already known.
 fn build_prompt(task: &Task) -> String {
-    if let Some(state) = &task.session_state {
-        return format!("Resuming WAY-{}: {}\n\nPrior session state:\n{}\n\nContinue from here.", task.key, task.title, state);
+    let refs = if task.external_refs.is_empty() { "(none)".to_string() } else { task.external_refs.join(", ") };
+
+    if task.session_decisions.is_some() || task.session_next.is_some() {
+        let decisions = task.session_decisions.as_deref().unwrap_or("(none recorded)");
+        let next = task.session_next.as_deref().unwrap_or("(none recorded)");
+        return format!(
+            "Resuming WAY-{}: {}\n\nDecisions so far:\n{decisions}\n\nNext:\n{next}\n\nExternal refs (resolve these live, don't assume anything about their current state): {refs}\n\nContinue from here.",
+            task.key, task.title
+        );
     }
 
     let description = if task.description.is_empty() { "(no description)".to_string() } else { task.description.clone() };
     let tags = if task.tags.is_empty() { "(none)".to_string() } else { task.tags.join(", ") };
     let pillar = task.pillar.as_deref().unwrap_or("(unassigned)");
-    format!("Starting WAY-{}: {}\n\n{description}\n\ntags: {tags}\npillar: {pillar}", task.key, task.title)
+    format!("Starting WAY-{}: {}\n\n{description}\n\ntags: {tags}\npillar: {pillar}\nexternal refs: {refs}", task.key, task.title)
 }
 
 /// Suspends the TUI, hands the real terminal to a `claude` subprocess seeded

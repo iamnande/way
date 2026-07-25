@@ -11,6 +11,10 @@ const PROFILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("profi
 const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settings");
 const ACTIVE_PROFILE_KEY: &str = "active_profile";
 
+fn now_unix() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
+
 #[derive(Debug, Serialize)]
 pub struct TaskTree {
     pub task: Task,
@@ -30,8 +34,12 @@ pub trait Store {
     fn archive(&self, id: u64) -> Result<()>;
     fn unarchive(&self, id: u64) -> Result<()>;
     fn set_pillar(&self, id: u64, pillar: Option<String>) -> Result<()>;
-    fn link_external(&self, id: u64, external_ref: Option<String>) -> Result<()>;
-    fn set_session_state(&self, id: u64, state: Option<String>) -> Result<()>;
+    fn add_external_ref(&self, id: u64, external_ref: String) -> Result<()>;
+    fn remove_external_ref(&self, id: u64, external_ref: &str) -> Result<()>;
+    fn clear_external_refs(&self, id: u64) -> Result<()>;
+    fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()>;
+    fn set_session_next(&self, id: u64, next: Option<String>) -> Result<()>;
+    fn clear_session(&self, id: u64) -> Result<()>;
     fn list_profiles(&self) -> Result<Vec<Profile>>;
     fn active_profile(&self) -> Result<Profile>;
     fn use_profile(&self, name: &str) -> Result<()>;
@@ -261,17 +269,58 @@ impl Store for RedbStore {
         Ok(())
     }
 
-    fn link_external(&self, id: u64, external_ref: Option<String>) -> Result<()> {
-        if let Some(mut task) = self.get(id)? {
-            task.external_ref = external_ref;
+    fn add_external_ref(&self, id: u64, external_ref: String) -> Result<()> {
+        if let Some(mut task) = self.get(id)?
+            && !task.external_refs.iter().any(|r| r == &external_ref)
+        {
+            task.external_refs.push(external_ref);
             self.put(&task)?;
         }
         Ok(())
     }
 
-    fn set_session_state(&self, id: u64, state: Option<String>) -> Result<()> {
+    fn remove_external_ref(&self, id: u64, external_ref: &str) -> Result<()> {
         if let Some(mut task) = self.get(id)? {
-            task.session_state = state;
+            let before = task.external_refs.len();
+            task.external_refs.retain(|r| r != external_ref);
+            if task.external_refs.len() != before {
+                self.put(&task)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_external_refs(&self, id: u64) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.external_refs.clear();
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.session_decisions = decisions;
+            task.session_updated_at = Some(now_unix()?);
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn set_session_next(&self, id: u64, next: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.session_next = next;
+            task.session_updated_at = Some(now_unix()?);
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn clear_session(&self, id: u64) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.session_decisions = None;
+            task.session_next = None;
+            task.session_updated_at = None;
             self.put(&task)?;
         }
         Ok(())
@@ -495,20 +544,56 @@ mod tests {
     }
 
     #[test]
-    fn session_state_round_trips_and_clears() {
+    fn session_decisions_and_next_round_trip_independently_and_share_updated_at() {
         let path = temp_path("session");
         let _ = std::fs::remove_file(&path);
 
         let store = RedbStore::open(&path).unwrap();
         let task = store.add("has a session".to_string(), String::new(), vec![]).unwrap();
-        store.set_session_state(task.id, Some("phase: grounding\nnext: draft prd".to_string())).unwrap();
 
-        let reloaded = store.find_by_key(task.key).unwrap().unwrap();
-        assert_eq!(reloaded.session_state, Some("phase: grounding\nnext: draft prd".to_string()));
+        store.set_session_decisions(task.id, Some("chose structured prose over a blob".to_string())).unwrap();
+        let after_decisions = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(after_decisions.session_decisions, Some("chose structured prose over a blob".to_string()));
+        assert_eq!(after_decisions.session_next, None);
+        assert!(after_decisions.session_updated_at.is_some());
+        let first_timestamp = after_decisions.session_updated_at.unwrap();
 
-        store.set_session_state(task.id, None).unwrap();
+        store.set_session_next(task.id, Some("draft the tech spec".to_string())).unwrap();
+        let after_next = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(after_next.session_decisions, Some("chose structured prose over a blob".to_string()), "setting next must not touch decisions");
+        assert_eq!(after_next.session_next, Some("draft the tech spec".to_string()));
+        assert!(after_next.session_updated_at.unwrap() >= first_timestamp, "updated_at is shared across both fields");
+
+        store.clear_session(task.id).unwrap();
         let cleared = store.find_by_key(task.key).unwrap().unwrap();
-        assert_eq!(cleared.session_state, None);
+        assert_eq!(cleared.session_decisions, None);
+        assert_eq!(cleared.session_next, None);
+        assert_eq!(cleared.session_updated_at, None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn external_refs_add_is_idempotent_and_remove_targets_one_entry() {
+        let path = temp_path("refs");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("has refs".to_string(), String::new(), vec![]).unwrap();
+
+        store.add_external_ref(task.id, "owner/repo#1".to_string()).unwrap();
+        store.add_external_ref(task.id, "owner/repo#1".to_string()).unwrap(); // duplicate, should be a no-op
+        store.add_external_ref(task.id, "PROJ-42".to_string()).unwrap();
+        let with_refs = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(with_refs.external_refs, vec!["owner/repo#1".to_string(), "PROJ-42".to_string()]);
+
+        store.remove_external_ref(task.id, "owner/repo#1").unwrap();
+        let one_removed = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(one_removed.external_refs, vec!["PROJ-42".to_string()]);
+
+        store.clear_external_refs(task.id).unwrap();
+        let cleared = store.find_by_key(task.key).unwrap().unwrap();
+        assert!(cleared.external_refs.is_empty());
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -110,9 +110,13 @@ pub struct Task {
     #[serde(default)]
     pub parent_key: Option<u32>,
     #[serde(default)]
-    pub external_ref: Option<String>,
+    pub external_refs: Vec<String>,
     #[serde(default)]
-    pub session_state: Option<String>,
+    pub session_decisions: Option<String>,
+    #[serde(default)]
+    pub session_next: Option<String>,
+    #[serde(default)]
+    pub session_updated_at: Option<i64>,
 }
 
 impl Task {
@@ -127,8 +131,10 @@ impl Task {
             archived: false,
             pillar: None,
             parent_key: None,
-            external_ref: None,
-            session_state: None,
+            external_refs: Vec::new(),
+            session_decisions: None,
+            session_next: None,
+            session_updated_at: None,
         }
     }
 }

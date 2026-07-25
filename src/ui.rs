@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -16,6 +18,20 @@ fn pillar_def_color(def: &PillarDef) -> Color {
 
 fn find_pillar_def<'a>(app: &'a App, name: &str) -> Option<&'a PillarDef> {
     app.active_profile.pillars.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+}
+
+fn relative_time(unix_seconds: i64) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(unix_seconds);
+    let delta = (now - unix_seconds).max(0);
+    if delta < 60 {
+        "just now".to_string()
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86400)
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -175,6 +191,8 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         None => ("(unassigned — press 'p')".to_string(), Style::default().fg(theme::DIM)),
     };
 
+    let refs = if task.external_refs.is_empty() { "(none)".to_string() } else { task.external_refs.join(", ") };
+
     let mut text = vec![
         Line::from(Span::styled(
             task.title.clone(),
@@ -196,8 +214,29 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(format!("{:<8}", "TAGS"), Style::default().fg(theme::DIM)),
             Span::styled(tags, Style::default().fg(theme::AQUA)),
         ]),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{:<8}", "REFS"), Style::default().fg(theme::DIM)),
+            Span::styled(refs, Style::default().fg(theme::AQUA)),
+        ]),
     ];
+
+    if let Some(parent_key) = task.parent_key {
+        text.push(Line::from(vec![
+            Span::styled(format!("{:<8}", "PARENT"), Style::default().fg(theme::DIM)),
+            Span::styled(format!("WAY-{parent_key}"), Style::default().fg(theme::FG)),
+        ]));
+    }
+
+    if task.session_decisions.is_some() || task.session_next.is_some() {
+        let when = task.session_updated_at.map(relative_time).unwrap_or_default();
+        let preview = task.session_next.as_deref().unwrap_or("(no next step recorded)");
+        text.push(Line::from(vec![
+            Span::styled(format!("{:<8}", "SESSION"), Style::default().fg(theme::DIM)),
+            Span::styled(format!("{when} · next: {}", truncate(preview, 48)), Style::default().fg(theme::ORANGE)),
+        ]));
+    }
+
+    text.push(Line::from(""));
     text.extend(multiline(description, Style::default().fg(theme::FG)));
 
     let detail = Paragraph::new(text).block(block).wrap(Wrap { trim: true });

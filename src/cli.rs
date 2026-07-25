@@ -55,8 +55,16 @@ pub enum Command {
     Done { key: u32 },
     /// Set a task's pillar, or "clear" to unset it
     Pillar { key: u32, pillar: String },
-    /// Attach an external issue reference (GH Discussion / Linear id), or "clear" to unset it
-    Link { key: u32, external_ref: String },
+    /// Attach an external pointer (GH Discussion / Linear / PR / ticket id).
+    /// A task may have more than one; adding a duplicate is a no-op.
+    /// `way link <key> clear` removes all pointers.
+    Link {
+        key: u32,
+        external_ref: String,
+        /// Remove this specific pointer instead of adding it
+        #[arg(long)]
+        remove: bool,
+    },
     /// Read/write a task's session resume-state
     Session {
         #[command(subcommand)]
@@ -71,11 +79,13 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
-    /// Read the resume-state blob from stdin and store it
-    Set { key: u32 },
-    /// Print the raw resume-state blob to stdout
+    /// Read decisions prose from stdin and store it
+    SetDecisions { key: u32 },
+    /// Read next-step prose from stdin and store it
+    SetNext { key: u32 },
+    /// Print decisions/next/updated-at as labeled plain text
     Show { key: u32 },
-    /// Clear the resume-state
+    /// Clear decisions, next, and updated-at together
     Clear { key: u32 },
 }
 
@@ -195,11 +205,16 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
             task.pillar = p.map(|p| p.to_lowercase());
             println!("{}", serde_json::to_string_pretty(&task)?);
         }
-        Command::Link { key, external_ref } => {
-            let mut task = find_by_key(store, key)?;
-            let r = if is_clear(&external_ref) { None } else { Some(external_ref) };
-            store.link_external(task.id, r.clone())?;
-            task.external_ref = r;
+        Command::Link { key, external_ref, remove } => {
+            let task = find_by_key(store, key)?;
+            if is_clear(&external_ref) {
+                store.clear_external_refs(task.id)?;
+            } else if remove {
+                store.remove_external_ref(task.id, &external_ref)?;
+            } else {
+                store.add_external_ref(task.id, external_ref)?;
+            }
+            let task = find_by_key(store, key)?;
             println!("{}", serde_json::to_string_pretty(&task)?);
         }
         Command::Session { action } => run_session(action, store)?,
@@ -210,22 +225,36 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
 
 fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
     match action {
-        SessionCommand::Set { key } => {
+        SessionCommand::SetDecisions { key } => {
             let task = find_by_key(store, key)?;
             let mut blob = String::new();
             std::io::stdin().read_to_string(&mut blob)?;
-            store.set_session_state(task.id, Some(blob))?;
+            store.set_session_decisions(task.id, Some(blob))?;
+        }
+        SessionCommand::SetNext { key } => {
+            let task = find_by_key(store, key)?;
+            let mut blob = String::new();
+            std::io::stdin().read_to_string(&mut blob)?;
+            store.set_session_next(task.id, Some(blob))?;
         }
         SessionCommand::Show { key } => {
             let task = find_by_key(store, key)?;
-            match task.session_state {
-                Some(state) => println!("{state}"),
-                None => bail!("no session state for WAY-{key}"),
+            if task.session_decisions.is_none() && task.session_next.is_none() {
+                bail!("no session state for WAY-{key}");
+            }
+            if let Some(decisions) = &task.session_decisions {
+                println!("decisions:\n{decisions}\n");
+            }
+            if let Some(next) = &task.session_next {
+                println!("next:\n{next}\n");
+            }
+            if let Some(updated_at) = task.session_updated_at {
+                println!("updated_at (unix seconds): {updated_at}");
             }
         }
         SessionCommand::Clear { key } => {
             let task = find_by_key(store, key)?;
-            store.set_session_state(task.id, None)?;
+            store.clear_session(task.id)?;
         }
     }
     Ok(())
