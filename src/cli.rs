@@ -102,9 +102,15 @@ pub enum SessionCommand {
     SetDecisions { key: u32 },
     /// Read next-step prose from stdin and store it
     SetNext { key: u32 },
-    /// Print decisions/next/updated-at as labeled plain text
+    /// Attach an existing claude session UUID (e.g. one you started outside
+    /// way) so 'c' resumes it instead of pinning a new one on next spawn
+    SetClaudeId { key: u32, session_id: String },
+    /// Detach the claude session id - next spawn starts a new one
+    ClearClaudeId { key: u32 },
+    /// Print decisions/next/updated-at/claude-session-id as labeled plain text
     Show { key: u32 },
-    /// Clear decisions, next, and updated-at together
+    /// Clear decisions, next, and updated-at together (leaves claude-session-id
+    /// alone - that's the live conversation's identity, not a summary of it)
     Clear { key: u32 },
 }
 
@@ -273,9 +279,17 @@ fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
             std::io::stdin().read_to_string(&mut blob)?;
             store.set_session_next(task.id, Some(blob))?;
         }
+        SessionCommand::SetClaudeId { key, session_id } => {
+            let task = find_by_key(store, key)?;
+            store.set_claude_session_id(task.id, Some(session_id))?;
+        }
+        SessionCommand::ClearClaudeId { key } => {
+            let task = find_by_key(store, key)?;
+            store.set_claude_session_id(task.id, None)?;
+        }
         SessionCommand::Show { key } => {
             let task = find_by_key(store, key)?;
-            if task.session_decisions.is_none() && task.session_next.is_none() {
+            if task.session_decisions.is_none() && task.session_next.is_none() && task.claude_session_id.is_none() {
                 bail!("no session state for WAY-{key}");
             }
             if let Some(decisions) = &task.session_decisions {
@@ -287,6 +301,7 @@ fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
             if let Some(updated_at) = task.session_updated_at {
                 println!("updated_at (unix seconds): {updated_at}");
             }
+            println!("claude_session_id: {}", task.claude_session_id.as_deref().unwrap_or("(none)"));
         }
         SessionCommand::Clear { key } => {
             let task = find_by_key(store, key)?;
