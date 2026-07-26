@@ -98,6 +98,65 @@ fn build_prompt(task: &Task) -> String {
     format!("Starting WAY-{}: {}\n\n{description}\n\ntags: {tags}\npillar: {pillar}\nexternal refs: {refs}", task.key, task.title)
 }
 
+/// Dispatches to whichever spawn strategy fits the terminal `way` is
+/// actually running in. Inside zellij, claude gets its own tab and way's own
+/// pane is never touched — "escaping" is just normal tab switching, so no
+/// signal ever reaches the claude process. Outside zellij there's no
+/// multiplexer to hand off to, so way falls back to the original behavior:
+/// take over the terminal, block, and restore it after.
+fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, task: &Task) -> Result<()> {
+    if std::env::var_os("ZELLIJ").is_some() {
+        return spawn_claude_session_zellij(app, task);
+    }
+    spawn_claude_session_foreground(terminal, app, task)
+}
+
+/// Runs claude in its own zellij tab named `WAY-<key>`, created via
+/// `zellij action new-tab -- <cmd>`, which returns as soon as the tab exists
+/// rather than blocking until the command inside it exits. If that tab is
+/// still open from a previous spawn, jumps back to it instead of starting a
+/// second, disconnected session for the same task.
+fn spawn_claude_session_zellij(app: &App, task: &Task) -> Result<()> {
+    let tab_name = format!("WAY-{}", task.key);
+
+    let existing = std::process::Command::new("zellij").args(["action", "query-tab-names"]).output()?;
+    let tab_is_open = String::from_utf8_lossy(&existing.stdout).lines().any(|line| line.trim() == tab_name);
+
+    if tab_is_open {
+        std::process::Command::new("zellij").args(["action", "go-to-tab-name", &tab_name]).status()?;
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let mut args = vec![
+        "action".to_string(),
+        "new-tab".to_string(),
+        "--name".to_string(),
+        tab_name,
+        "--cwd".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "--".to_string(),
+        "claude".to_string(),
+    ];
+
+    match &task.claude_session_id {
+        Some(session_id) => {
+            args.push("--resume".to_string());
+            args.push(session_id.clone());
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            app.set_claude_session_id(task.id, Some(new_id.clone()))?;
+            args.push("--session-id".to_string());
+            args.push(new_id);
+            args.push(build_prompt(task));
+        }
+    }
+
+    std::process::Command::new("zellij").args(&args).status()?;
+    Ok(())
+}
+
 /// Suspends the TUI, hands the real terminal to a `claude` subprocess, waits
 /// for it to exit, then restores the TUI. If the task already has a
 /// `claude_session_id` (a prior spawn from `way`), this is a true resume —
@@ -105,20 +164,16 @@ fn build_prompt(task: &Task) -> String {
 /// injected prompt, matching what "re-attach" is actually supposed to mean.
 /// Otherwise a fresh session is pinned to a new UUID via `--session-id` (so
 /// it can be resumed next time) and seeded with the assembled prompt.
-/// `launch_args` (from `way config set-claude-args`, e.g.
-/// "--dangerously-skip-permissions") is split on whitespace and applied
-/// either way — no quoting support, this is meant for simple flags.
-fn spawn_claude_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, task: &Task) -> Result<()> {
-    let launch_args = app.claude_launch_args()?;
-
+fn spawn_claude_session_foreground(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
+    task: &Task,
+) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     let mut cmd = std::process::Command::new("claude");
-    if let Some(args) = &launch_args {
-        cmd.args(args.split_whitespace());
-    }
 
     let result = match &task.claude_session_id {
         Some(session_id) => {
