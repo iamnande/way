@@ -38,6 +38,7 @@ pub trait Store {
     fn add_external_ref(&self, id: u64, external_ref: String) -> Result<()>;
     fn remove_external_ref(&self, id: u64, external_ref: &str) -> Result<()>;
     fn clear_external_refs(&self, id: u64) -> Result<()>;
+    fn set_session_phase(&self, id: u64, phase: Option<String>) -> Result<()>;
     fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()>;
     fn set_session_next(&self, id: u64, next: Option<String>) -> Result<()>;
     fn clear_session(&self, id: u64) -> Result<()>;
@@ -302,6 +303,15 @@ impl Store for RedbStore {
         Ok(())
     }
 
+    fn set_session_phase(&self, id: u64, phase: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.phase = phase;
+            task.session_updated_at = Some(now_unix()?);
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
     fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()> {
         if let Some(mut task) = self.get(id)? {
             task.session_decisions = decisions;
@@ -322,6 +332,7 @@ impl Store for RedbStore {
 
     fn clear_session(&self, id: u64) -> Result<()> {
         if let Some(mut task) = self.get(id)? {
+            task.phase = None;
             task.session_decisions = None;
             task.session_next = None;
             task.session_updated_at = None;
@@ -579,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn session_decisions_and_next_round_trip_independently_and_share_updated_at() {
+    fn session_phase_decisions_and_next_round_trip_independently_and_share_updated_at() {
         let path = temp_path("session");
         let _ = std::fs::remove_file(&path);
 
@@ -599,8 +610,15 @@ mod tests {
         assert_eq!(after_next.session_next, Some("draft the tech spec".to_string()));
         assert!(after_next.session_updated_at.unwrap() >= first_timestamp, "updated_at is shared across both fields");
 
+        store.set_session_phase(task.id, Some("grounding".to_string())).unwrap();
+        let after_phase = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(after_phase.phase, Some("grounding".to_string()));
+        assert_eq!(after_phase.session_decisions, Some("chose structured prose over a blob".to_string()), "setting phase must not touch decisions");
+        assert_eq!(after_phase.session_next, Some("draft the tech spec".to_string()), "setting phase must not touch next");
+
         store.clear_session(task.id).unwrap();
         let cleared = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(cleared.phase, None);
         assert_eq!(cleared.session_decisions, None);
         assert_eq!(cleared.session_next, None);
         assert_eq!(cleared.session_updated_at, None);

@@ -98,6 +98,9 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
+    /// Set the task's phase - free-form, not tied to any one workflow's
+    /// vocabulary (e.g. "grounding", "planning", or anything else)
+    SetPhase { key: u32, phase: String },
     /// Read decisions prose from stdin and store it
     SetDecisions { key: u32 },
     /// Read next-step prose from stdin and store it
@@ -107,10 +110,11 @@ pub enum SessionCommand {
     SetClaudeId { key: u32, session_id: String },
     /// Detach the claude session id - next spawn starts a new one
     ClearClaudeId { key: u32 },
-    /// Print decisions/next/updated-at/claude-session-id as labeled plain text
+    /// Print phase/decisions/next/updated-at/claude-session-id as labeled plain text
     Show { key: u32 },
-    /// Clear decisions, next, and updated-at together (leaves claude-session-id
-    /// alone - that's the live conversation's identity, not a summary of it)
+    /// Clear phase, decisions, next, and updated-at together (leaves
+    /// claude-session-id alone - that's the live conversation's identity,
+    /// not a summary of it)
     Clear { key: u32 },
 }
 
@@ -267,6 +271,10 @@ fn run_config(action: ConfigCommand, store: &dyn Store) -> Result<()> {
 
 fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
     match action {
+        SessionCommand::SetPhase { key, phase } => {
+            let task = find_by_key(store, key)?;
+            store.set_session_phase(task.id, Some(phase))?;
+        }
         SessionCommand::SetDecisions { key } => {
             let task = find_by_key(store, key)?;
             let mut blob = String::new();
@@ -289,8 +297,15 @@ fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
         }
         SessionCommand::Show { key } => {
             let task = find_by_key(store, key)?;
-            if task.session_decisions.is_none() && task.session_next.is_none() && task.claude_session_id.is_none() {
+            if task.phase.is_none()
+                && task.session_decisions.is_none()
+                && task.session_next.is_none()
+                && task.claude_session_id.is_none()
+            {
                 bail!("no session state for WAY-{key}");
+            }
+            if let Some(phase) = &task.phase {
+                println!("phase: {phase}\n");
             }
             if let Some(decisions) = &task.session_decisions {
                 println!("decisions:\n{decisions}\n");

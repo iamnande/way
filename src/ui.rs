@@ -227,12 +227,16 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
 
-    if task.session_decisions.is_some() || task.session_next.is_some() {
+    if task.phase.is_some() || task.session_decisions.is_some() || task.session_next.is_some() {
+        let phase = task.phase.as_deref().unwrap_or("(no phase)");
         let when = task.session_updated_at.map(relative_time).unwrap_or_default();
         let preview = task.session_next.as_deref().unwrap_or("(no next step recorded)");
         text.push(Line::from(vec![
             Span::styled(format!("{:<8}", "SESSION"), Style::default().fg(theme::DIM)),
-            Span::styled(format!("{when} · next: {}", truncate(preview, 48)), Style::default().fg(theme::ORANGE)),
+            Span::styled(
+                format!("{phase} · {when} · next: {}", truncate(preview, 48)),
+                Style::default().fg(theme::ORANGE),
+            ),
         ]));
     }
 

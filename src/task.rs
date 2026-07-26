@@ -111,6 +111,11 @@ pub struct Task {
     pub parent_key: Option<u32>,
     #[serde(default)]
     pub external_refs: Vec<String>,
+    /// Free-form, like decisions/next — not tied to any one workflow's phase
+    /// vocabulary (senzu's grounding/spec/planning/... is just one possible
+    /// set of values `way` never validates or interprets).
+    #[serde(default)]
+    pub phase: Option<String>,
     #[serde(default)]
     pub session_decisions: Option<String>,
     #[serde(default)]
@@ -137,6 +142,7 @@ impl Task {
             pillar: None,
             parent_key: None,
             external_refs: Vec::new(),
+            phase: None,
             session_decisions: None,
             session_next: None,
             session_updated_at: None,
