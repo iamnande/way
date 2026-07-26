@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
@@ -53,22 +54,40 @@ pub trait Store {
 
 pub struct RedbStore {
     db: Database,
+    path: PathBuf,
 }
 
 impl RedbStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let db = Database::create(path.as_ref())?;
+        let path = path.as_ref().to_path_buf();
+        let db = Database::create(&path)?;
         let write_txn = db.begin_write()?;
         write_txn.open_table(TABLE)?;
         write_txn.open_table(PROFILES_TABLE)?;
         write_txn.open_table(SETTINGS_TABLE)?;
         write_txn.commit()?;
 
-        let store = Self { db };
+        let store = Self { db, path };
         store.backfill_keys()?;
         store.normalize_pillars()?;
         store.bootstrap_default_profile()?;
         Ok(store)
+    }
+
+    /// Sidecar file bumped on every successful write. redb touches the
+    /// database file's mtime on every *open*, including plain reads (its
+    /// `Database::create`/`open` do bookkeeping that writes to the file
+    /// regardless), so a filesystem watcher pointed at the `.redb` file
+    /// directly would re-trigger itself on the TUI's own read-driven
+    /// refreshes, forever. This file only changes when data actually
+    /// changes, so watching it gives a clean, loop-free signal.
+    pub fn marker_path(db_path: &Path) -> PathBuf {
+        db_path.with_extension("touch")
+    }
+
+    fn touch_marker(&self) -> Result<()> {
+        std::fs::write(Self::marker_path(&self.path), now_unix()?.to_string())?;
+        Ok(())
     }
 
     fn all_tasks(&self) -> Result<Vec<Task>> {
@@ -136,6 +155,7 @@ impl RedbStore {
             table.insert(task.id, bytes.as_slice())?;
         }
         write_txn.commit()?;
+        self.touch_marker()?;
         Ok(())
     }
 
@@ -379,6 +399,7 @@ impl Store for RedbStore {
             settings.insert(ACTIVE_PROFILE_KEY, name)?;
         }
         write_txn.commit()?;
+        self.touch_marker()?;
         Ok(())
     }
 
@@ -397,6 +418,7 @@ impl Store for RedbStore {
             table.insert(profile.name.as_str(), bytes.as_slice())?;
         }
         write_txn.commit()?;
+        self.touch_marker()?;
         Ok(())
     }
 
@@ -420,6 +442,7 @@ impl Store for RedbStore {
             }
         }
         write_txn.commit()?;
+        self.touch_marker()?;
         Ok(())
     }
 
