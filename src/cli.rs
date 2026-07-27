@@ -153,6 +153,50 @@ fn find_by_key(store: &dyn Store, key: u32) -> Result<crate::task::Task> {
     store.find_by_key(key)?.ok_or_else(|| anyhow!("no task with key WAY-{key}"))
 }
 
+/// The WAY-N a spawned claude session is bound to, set by `way` itself at
+/// spawn time (see `agent_session::spawn_agent_session_*`). Lets `add`/
+/// `spawn` tell whether they're being called from inside a task-bound
+/// session at all, rather than trusting the caller (agent or human) to
+/// remember and say so.
+fn active_key() -> Option<u32> {
+    std::env::var(crate::agent_session::ACTIVE_KEY_ENV).ok().and_then(|s| s.parse().ok())
+}
+
+/// Lineage enforcement: while a session is bound to WAY-N, any task it
+/// creates must attach under that lineage - a bare `add` (no parent at all)
+/// or a `spawn` off some unrelated task are both refused. `new_parent` is
+/// `None` for `add`, `Some(parent_key)` for `spawn`.
+fn enforce_lineage(new_parent: Option<u32>) -> Result<()> {
+    let Some(active) = active_key() else { return Ok(()) };
+    match new_parent {
+        None => bail!(
+            "this session is bound to WAY-{active} - top-level `add` is disallowed while bound. \
+            Use `way spawn {active} ...` for related work discovered along the way, \
+            or update WAY-{active} directly (`way session ...`) if this *is* that task."
+        ),
+        Some(parent_key) if parent_key != active => {
+            bail!("this session is bound to WAY-{active} - spawn must parent off WAY-{active}, not WAY-{parent_key}")
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Duplicate-of guard: distinct from lineage enforcement above. A child that
+/// merely restates its parent's title isn't a lineage branch, it's a
+/// duplicate of the parent - the same failure mode `enforce_lineage` guards
+/// against, reachable via the very fallback path its error message points
+/// to. Scoped to this one parent, not a tracker-wide title-uniqueness rule.
+fn refuse_clone_of_parent(parent: &crate::task::Task, title: &str) -> Result<()> {
+    let key = parent.key;
+    if title.trim().eq_ignore_ascii_case(parent.title.trim()) {
+        bail!(
+            "WAY-{key} already has this title - that's a duplicate of it, not a child of it. \
+            Work WAY-{key} directly instead of spawning a clone."
+        );
+    }
+    Ok(())
+}
+
 fn parse_pillar_spec(spec: &str) -> Result<Vec<PillarDef>> {
     spec.split(',')
         .map(|entry| {
@@ -178,6 +222,7 @@ fn parse_pillar_spec(spec: &str) -> Result<Vec<PillarDef>> {
 pub fn run(command: Command, store: &dyn Store) -> Result<()> {
     match command {
         Command::Add { title, description, tags, pillar } => {
+            enforce_lineage(None)?;
             let tags = split_tags(tags);
             let mut task = store.add(title, description.unwrap_or_default(), tags)?;
             if let Some(p) = pillar {
@@ -187,6 +232,9 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&task)?);
         }
         Command::Spawn { parent_key, title, description, tags, pillar } => {
+            enforce_lineage(Some(parent_key))?;
+            let parent = find_by_key(store, parent_key)?;
+            refuse_clone_of_parent(&parent, &title)?;
             let tags = split_tags(tags);
             let mut task = store.spawn_child(parent_key, title, description.unwrap_or_default(), tags)?;
             if let Some(p) = pillar {
