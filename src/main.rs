@@ -1,6 +1,7 @@
 mod app;
 mod agent_session;
 mod cli;
+mod multiplexer;
 mod store;
 mod task;
 mod theme;

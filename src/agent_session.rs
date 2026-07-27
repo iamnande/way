@@ -9,6 +9,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use uuid::Uuid;
 
 use crate::app::App;
+use crate::multiplexer::{Multiplexer, Zellij};
 use crate::store::Store;
 use crate::task::Task;
 
@@ -95,59 +96,65 @@ pub fn launch_claude_for_task(store: &dyn Store, task: &Task) -> Result<()> {
     Ok(())
 }
 
-/// Dispatches to whichever spawn strategy fits the terminal `way` is
-/// actually running in. Inside zellij, the agent gets its own tab and way's
-/// own pane is never touched — "escaping" is just normal tab switching, so no
-/// signal ever reaches the agent process. Outside zellij there's no
-/// multiplexer to hand off to, so way falls back to the original behavior:
+/// The stable part of a task's tab name - used to find an already-open tab
+/// even after its label's mutable suffix (status) has gone stale.
+fn tab_prefix(key: u32) -> String {
+    format!("[WAY-{key}] ")
+}
+
+fn tab_status(task: &Task) -> &str {
+    if task.done {
+        "done"
+    } else if task.waiting_on.is_some() {
+        "waiting"
+    } else {
+        task.phase.as_deref().unwrap_or("active")
+    }
+}
+
+fn tab_label(task: &Task) -> String {
+    format!("{}{} - {}", tab_prefix(task.key), task.title, tab_status(task))
+}
+
+/// Dispatches to whichever spawn strategy is actually usable. Zellij's
+/// mechanics are fully insulated behind `Multiplexer` - this only knows
+/// "is there a multiplexer available at all," not zellij specifically, so a
+/// future swap (tmux, say) only touches that trait's implementation. With
+/// no multiplexer usable at all, way falls back to the original behavior:
 /// take over the terminal, block, and restore it after.
 pub fn spawn_agent_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, task: &Task) -> Result<()> {
-    if std::env::var_os("ZELLIJ").is_some() {
-        return spawn_agent_session_zellij(task);
+    if Zellij::is_installed() {
+        return spawn_agent_session_multiplexed(task);
     }
     spawn_agent_session_foreground(terminal, app, task)
 }
 
-/// Runs the agent in its own zellij tab named `WAY-<key>`, created via
-/// `zellij action new-tab -- <cmd>`, which returns as soon as the tab exists
-/// rather than blocking until the command inside it exits. If that tab is
-/// still open from a previous spawn, jumps back to it instead of starting a
-/// second, disconnected session for the same task.
+/// Runs the agent in its own tab in way's dedicated multiplexer session
+/// (separate from whatever session the user's own daily-driver terminal
+/// uses), created via `Multiplexer::new_tab`, which returns as soon as the
+/// tab exists rather than blocking until the command inside it exits. If a
+/// tab for this task is already open, jumps back to it instead of starting
+/// a second, disconnected one for the same task.
 ///
 /// The tab's command is `way launch <key>`, not claude directly - see
 /// `launch_claude_for_task` for why that indirection is load-bearing rather
 /// than incidental.
-fn spawn_agent_session_zellij(task: &Task) -> Result<()> {
-    let tab_name = format!("WAY-{}", task.key);
+fn spawn_agent_session_multiplexed(task: &Task) -> Result<()> {
+    let mux = Zellij::connect()?;
+    let prefix = tab_prefix(task.key);
 
-    let existing = std::process::Command::new("zellij").args(["action", "query-tab-names"]).output()?;
-    let tab_is_open = String::from_utf8_lossy(&existing.stdout).lines().any(|line| line.trim() == tab_name);
-
-    if tab_is_open {
-        std::process::Command::new("zellij").args(["action", "go-to-tab-name", &tab_name]).status()?;
+    if let Some(existing) = mux.find_tab(&prefix)? {
+        mux.go_to_tab(&existing)?;
         return Ok(());
     }
 
     let cwd = std::env::current_dir()?;
     // The absolute path to the currently-running binary, not a bare "way" -
     // this must resolve correctly even if `way` isn't on PATH, since it's
-    // zellij (not a shell) execing this argv directly.
-    let way_exe = std::env::current_exe()?;
-    let args = vec![
-        "action".to_string(),
-        "new-tab".to_string(),
-        "--name".to_string(),
-        tab_name,
-        "--cwd".to_string(),
-        cwd.to_string_lossy().into_owned(),
-        "--".to_string(),
-        way_exe.to_string_lossy().into_owned(),
-        "launch".to_string(),
-        task.key.to_string(),
-    ];
-
-    std::process::Command::new("zellij").args(&args).status()?;
-    Ok(())
+    // the multiplexer (not a shell) execing this argv directly.
+    let way_exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let argv = vec![way_exe, "launch".to_string(), task.key.to_string()];
+    mux.new_tab(&tab_label(task), &cwd, &argv)
 }
 
 /// Suspends the TUI, hands the real terminal to the agent subprocess, waits

@@ -59,6 +59,11 @@ pub enum Command {
     /// that indirection (re-check at execution time, don't bake a frozen
     /// decision into the tab's argv) matters for zellij's own resurrection.
     Launch { key: u32 },
+    /// Attach to way's dedicated multiplexer session, creating it if needed
+    /// and immediately rerunning every tab's command if resurrecting one
+    /// that was killed. Run this from a plain shell, not from inside an
+    /// existing multiplexer session.
+    Resume,
     /// Set a task's pillar, or "clear" to unset it
     Pillar { key: u32, pillar: String },
     /// Attach an external pointer (GH Discussion / Linear / PR / ticket id).
@@ -284,6 +289,9 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
         Command::Launch { key } => {
             let task = find_by_key(store, key)?;
             crate::agent_session::launch_claude_for_task(store, &task)?;
+        }
+        Command::Resume => {
+            crate::multiplexer::resume()?;
         }
         Command::Pillar { key, pillar } => {
             let mut task = find_by_key(store, key)?;
