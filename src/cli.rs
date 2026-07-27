@@ -53,6 +53,12 @@ pub enum Command {
     Tree { key: u32 },
     /// Mark a task done (idempotent)
     Done { key: u32 },
+    /// Decide resume-vs-fresh for WAY-N from the store's current state and
+    /// run claude accordingly. This is what a spawned zellij tab's command
+    /// actually is - see `agent_session::launch_claude_for_task` for why
+    /// that indirection (re-check at execution time, don't bake a frozen
+    /// decision into the tab's argv) matters for zellij's own resurrection.
+    Launch { key: u32 },
     /// Set a task's pillar, or "clear" to unset it
     Pillar { key: u32, pillar: String },
     /// Attach an external pointer (GH Discussion / Linear / PR / ticket id).
@@ -274,6 +280,10 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
                 task.done = true;
             }
             println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        Command::Launch { key } => {
+            let task = find_by_key(store, key)?;
+            crate::agent_session::launch_claude_for_task(store, &task)?;
         }
         Command::Pillar { key, pillar } => {
             let mut task = find_by_key(store, key)?;

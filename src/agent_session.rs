@@ -9,6 +9,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use uuid::Uuid;
 
 use crate::app::App;
+use crate::store::Store;
 use crate::task::Task;
 
 /// Env var a spawned agent session is bound to its originating WAY-N through.
@@ -58,6 +59,42 @@ fn build_prompt(task: &Task) -> String {
     )
 }
 
+/// Decides resume-vs-fresh from the store's *current* state and runs claude
+/// accordingly. This is the one place that decision gets made - both the
+/// foreground path and `way launch` (see cli.rs) call through here rather
+/// than each baking their own copy of the branch.
+///
+/// That single choke point matters beyond DRY: `way launch <key>` is what
+/// gets embedded as a zellij pane's command, and zellij remembers/reruns
+/// that literal argv verbatim if the pane is ever resurrected after zellij
+/// itself was killed and restarted. If the resume-vs-fresh decision were
+/// baked into that argv instead (e.g. a frozen `--session-id <id> "<prompt>"`
+/// from the very first spawn), resurrection would replay it unchanged -
+/// resending the entire original prompt as a "new" message on top of
+/// whatever conversation already happened, or erroring on a reused
+/// session-id. Re-deriving the decision here, at actual execution time,
+/// means a resurrection replay of `way launch <key>` sees the session id
+/// this function already persisted the first time and correctly resumes
+/// instead.
+pub fn launch_claude_for_task(store: &dyn Store, task: &Task) -> Result<()> {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.env(ACTIVE_KEY_ENV, task.key.to_string());
+
+    match &task.claude_session_id {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(session_id);
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            store.set_claude_session_id(task.id, Some(new_id.clone()))?;
+            cmd.arg("--session-id").arg(&new_id).arg(build_prompt(task));
+        }
+    }
+
+    cmd.status()?;
+    Ok(())
+}
+
 /// Dispatches to whichever spawn strategy fits the terminal `way` is
 /// actually running in. Inside zellij, the agent gets its own tab and way's
 /// own pane is never touched — "escaping" is just normal tab switching, so no
@@ -66,7 +103,7 @@ fn build_prompt(task: &Task) -> String {
 /// take over the terminal, block, and restore it after.
 pub fn spawn_agent_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, task: &Task) -> Result<()> {
     if std::env::var_os("ZELLIJ").is_some() {
-        return spawn_agent_session_zellij(app, task);
+        return spawn_agent_session_zellij(task);
     }
     spawn_agent_session_foreground(terminal, app, task)
 }
@@ -76,7 +113,11 @@ pub fn spawn_agent_session(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>
 /// rather than blocking until the command inside it exits. If that tab is
 /// still open from a previous spawn, jumps back to it instead of starting a
 /// second, disconnected session for the same task.
-fn spawn_agent_session_zellij(app: &App, task: &Task) -> Result<()> {
+///
+/// The tab's command is `way launch <key>`, not claude directly - see
+/// `launch_claude_for_task` for why that indirection is load-bearing rather
+/// than incidental.
+fn spawn_agent_session_zellij(task: &Task) -> Result<()> {
     let tab_name = format!("WAY-{}", task.key);
 
     let existing = std::process::Command::new("zellij").args(["action", "query-tab-names"]).output()?;
@@ -88,7 +129,11 @@ fn spawn_agent_session_zellij(app: &App, task: &Task) -> Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    let mut args = vec![
+    // The absolute path to the currently-running binary, not a bare "way" -
+    // this must resolve correctly even if `way` isn't on PATH, since it's
+    // zellij (not a shell) execing this argv directly.
+    let way_exe = std::env::current_exe()?;
+    let args = vec![
         "action".to_string(),
         "new-tab".to_string(),
         "--name".to_string(),
@@ -96,40 +141,17 @@ fn spawn_agent_session_zellij(app: &App, task: &Task) -> Result<()> {
         "--cwd".to_string(),
         cwd.to_string_lossy().into_owned(),
         "--".to_string(),
-        // No shell is involved in this spawn (zellij execs argv directly), so
-        // `env` (coreutils) is the only quote-free way to set a var on just
-        // this child process - it can't rely on however the zellij server's
-        // own environment happened to be inherited.
-        "env".to_string(),
-        format!("{ACTIVE_KEY_ENV}={}", task.key),
-        "claude".to_string(),
+        way_exe.to_string_lossy().into_owned(),
+        "launch".to_string(),
+        task.key.to_string(),
     ];
-
-    match &task.claude_session_id {
-        Some(session_id) => {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
-        }
-        None => {
-            let new_id = Uuid::new_v4().to_string();
-            app.set_claude_session_id(task.id, Some(new_id.clone()))?;
-            args.push("--session-id".to_string());
-            args.push(new_id);
-            args.push(build_prompt(task));
-        }
-    }
 
     std::process::Command::new("zellij").args(&args).status()?;
     Ok(())
 }
 
 /// Suspends the TUI, hands the real terminal to the agent subprocess, waits
-/// for it to exit, then restores the TUI. If the task already has a
-/// `claude_session_id` (a prior spawn from `way`), this is a true resume —
-/// `--resume <id>` drops back into the exact same conversation, no injected
-/// prompt, matching what "re-attach" is actually supposed to mean. Otherwise
-/// a fresh session is pinned to a new UUID via `--session-id` (so it can be
-/// resumed next time) and seeded with the assembled prompt.
+/// for it to exit, then restores the TUI.
 fn spawn_agent_session_foreground(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &App,
@@ -139,27 +161,12 @@ fn spawn_agent_session_foreground(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    let mut cmd = std::process::Command::new("claude");
-    cmd.env(ACTIVE_KEY_ENV, task.key.to_string());
-
-    let result = match &task.claude_session_id {
-        Some(session_id) => {
-            cmd.arg("--resume").arg(session_id);
-            cmd.status()
-        }
-        None => {
-            let new_id = Uuid::new_v4().to_string();
-            app.set_claude_session_id(task.id, Some(new_id.clone()))?;
-            cmd.arg("--session-id").arg(&new_id).arg(build_prompt(task));
-            cmd.status()
-        }
-    };
+    let result = launch_claude_for_task(app.store(), task);
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
     terminal.clear()?;
 
-    result?;
-    Ok(())
+    result
 }

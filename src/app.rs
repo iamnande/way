@@ -326,7 +326,7 @@ impl App {
         self.store.claude_launch_args()
     }
 
-    pub fn set_claude_session_id(&self, task_id: u64, session_id: Option<String>) -> Result<()> {
-        self.store.set_claude_session_id(task_id, session_id)
+    pub fn store(&self) -> &dyn Store {
+        self.store.as_ref()
     }
 }
