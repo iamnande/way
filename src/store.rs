@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 
 use crate::task::{Profile, Task};
@@ -10,11 +10,24 @@ use crate::task::{Profile, Task};
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tasks");
 const PROFILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("profiles");
 const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settings");
-const ACTIVE_PROFILE_KEY: &str = "active_profile";
-const CLAUDE_LAUNCH_ARGS_KEY: &str = "claude_launch_args";
+const ACTIVE_PROFILE_KEY_PREFIX: &str = "active_profile:";
 
 fn now_unix() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
+
+/// Best-effort local username, used to stamp `Task::owner` at creation and to
+/// scope the active-profile setting below. No login/auth exists yet, so this
+/// is a convenience label, not an identity.
+fn local_owner() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Active profile is scoped per local-owner rather than one global setting,
+/// so the store doesn't need a schema change when a real multi-user backend
+/// replaces `local_owner()` with an authenticated identity.
+fn active_profile_key(owner: &str) -> String {
+    format!("{ACTIVE_PROFILE_KEY_PREFIX}{owner}")
 }
 
 #[derive(Debug, Serialize)]
@@ -39,7 +52,9 @@ pub trait Store {
     fn add_external_ref(&self, id: u64, external_ref: String) -> Result<()>;
     fn remove_external_ref(&self, id: u64, external_ref: &str) -> Result<()>;
     fn clear_external_refs(&self, id: u64) -> Result<()>;
-    fn set_session_phase(&self, id: u64, phase: Option<String>) -> Result<()>;
+    /// `force` bypasses order validation against the active profile's
+    /// configured `phases` list (no-op when that list is empty either way).
+    fn set_session_phase(&self, id: u64, phase: Option<String>, force: bool) -> Result<()>;
     fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()>;
     fn set_session_next(&self, id: u64, next: Option<String>) -> Result<()>;
     fn clear_session(&self, id: u64) -> Result<()>;
@@ -47,33 +62,46 @@ pub trait Store {
     fn active_profile(&self) -> Result<Profile>;
     fn use_profile(&self, name: &str) -> Result<()>;
     fn add_profile(&self, profile: Profile) -> Result<()>;
-    fn claude_launch_args(&self) -> Result<Option<String>>;
-    fn set_claude_launch_args(&self, args: Option<String>) -> Result<()>;
     fn set_claude_session_id(&self, id: u64, session_id: Option<String>) -> Result<()>;
+    /// `Some` sets `waiting_on` + stamps `waiting_on_since` together; `None`
+    /// clears both together.
+    fn set_waiting(&self, id: u64, reason: Option<String>) -> Result<()>;
 }
 
+/// Holds only the path, not an open `Database` — redb takes an OS file lock
+/// for as long as a `Database` handle is alive, and only one process may hold
+/// it at a time. `way` is spawned long-lived (the TUI) but also invoked
+/// as a one-shot CLI from *inside* a `claude` session it spawned (`way
+/// session set-phase`, etc.), so the parent's handle can't be held for its
+/// whole lifetime — that would lock the child out for as long as the parent
+/// runs. Each operation opens fresh and lets the `Database` drop (releasing
+/// the lock) as soon as its transaction is done.
 pub struct RedbStore {
-    db: Database,
     path: PathBuf,
 }
 
 impl RedbStore {
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let db = Database::create(&path)?;
-        let write_txn = db.begin_write()?;
-        write_txn.open_table(TABLE)?;
-        write_txn.open_table(PROFILES_TABLE)?;
-        write_txn.open_table(SETTINGS_TABLE)?;
-        write_txn.commit()?;
-
-        let store = Self { db, path };
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let store = Self { path: path.as_ref().to_path_buf() };
+        {
+            let db = store.db()?;
+            let write_txn = db.begin_write()?;
+            write_txn.open_table(TABLE)?;
+            write_txn.open_table(PROFILES_TABLE)?;
+            write_txn.open_table(SETTINGS_TABLE)?;
+            write_txn.commit()?;
+        }
         store.backfill_keys()?;
         store.normalize_pillars()?;
         store.bootstrap_default_profile()?;
         Ok(store)
     }
 
+    /// redb only lets one process hold an open `Database` handle at a time,
+    /// so a collision here means another `way` process is mid-transaction,
+    /// not that the store is unusable. That window is only ever a single
+    /// transaction wide (see the type-level doc comment), so a short retry
+    /// clears it instead of surfacing a spurious "already open" error.
     /// Sidecar file bumped on every successful write. redb touches the
     /// database file's mtime on every *open*, including plain reads (its
     /// `Database::create`/`open` do bookkeeping that writes to the file
@@ -90,8 +118,24 @@ impl RedbStore {
         Ok(())
     }
 
+    fn db(&self) -> Result<Database> {
+        let mut wait = Duration::from_millis(2);
+        for _ in 0..10 {
+            match Database::create(&self.path) {
+                Ok(db) => return Ok(db),
+                Err(DatabaseError::DatabaseAlreadyOpen) => {
+                    std::thread::sleep(wait);
+                    wait *= 2;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(Database::create(&self.path)?)
+    }
+
     fn all_tasks(&self) -> Result<Vec<Task>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table = read_txn.open_table(TABLE)?;
         let tasks: Vec<Task> = table
             .iter()?
@@ -149,7 +193,8 @@ impl RedbStore {
 
     fn put(&self, task: &Task) -> Result<()> {
         let bytes = serde_json::to_vec(task)?;
-        let write_txn = self.db.begin_write()?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
         {
             let mut table = write_txn.open_table(TABLE)?;
             table.insert(task.id, bytes.as_slice())?;
@@ -166,7 +211,8 @@ impl RedbStore {
     }
 
     fn get(&self, id: u64) -> Result<Option<Task>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table = read_txn.open_table(TABLE)?;
         match table.get(id)? {
             Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
@@ -184,7 +230,7 @@ impl Store for RedbStore {
     fn add(&self, title: String, description: String, tags: Vec<String>) -> Result<Task> {
         let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
         let key = self.next_key()?;
-        let task = Task::new(id, key, title, description, tags);
+        let task = Task::new(id, key, title, description, tags, local_owner());
         self.put(&task)?;
         Ok(task)
     }
@@ -196,7 +242,7 @@ impl Store for RedbStore {
         }
         let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
         let key = self.next_key()?;
-        let mut task = Task::new(id, key, title, description, tags);
+        let mut task = Task::new(id, key, title, description, tags, local_owner());
         task.parent_key = Some(parent_key);
         self.put(&task)?;
         Ok(task)
@@ -323,10 +369,42 @@ impl Store for RedbStore {
         Ok(())
     }
 
-    fn set_session_phase(&self, id: u64, phase: Option<String>) -> Result<()> {
+    fn set_session_phase(&self, id: u64, phase: Option<String>, force: bool) -> Result<()> {
         if let Some(mut task) = self.get(id)? {
+            if let (Some(new_phase), false) = (&phase, force) {
+                let profile = self.active_profile()?;
+                if !profile.phases.is_empty() {
+                    let new_idx = profile.phases.iter().position(|p| p == new_phase).ok_or_else(|| {
+                        anyhow!(
+                            "unknown phase '{new_phase}' for active profile '{}' (pass --force to set it anyway)",
+                            profile.name
+                        )
+                    })?;
+                    let cur_idx = task.phase.as_ref().and_then(|p| profile.phases.iter().position(|x| x == p));
+                    let skips_ahead = match cur_idx {
+                        None => new_idx > 0,
+                        Some(cur) => new_idx > cur + 1,
+                    };
+                    if skips_ahead {
+                        bail!(
+                            "phase '{new_phase}' skips ahead of '{}' in profile '{}' (pass --force to override)",
+                            task.phase.as_deref().unwrap_or("(none)"),
+                            profile.name
+                        );
+                    }
+                }
+            }
             task.phase = phase;
             task.session_updated_at = Some(now_unix()?);
+            self.put(&task)?;
+        }
+        Ok(())
+    }
+
+    fn set_waiting(&self, id: u64, reason: Option<String>) -> Result<()> {
+        if let Some(mut task) = self.get(id)? {
+            task.waiting_on = reason;
+            task.waiting_on_since = if task.waiting_on.is_some() { Some(now_unix()?) } else { None };
             self.put(&task)?;
         }
         Ok(())
@@ -356,13 +434,16 @@ impl Store for RedbStore {
             task.session_decisions = None;
             task.session_next = None;
             task.session_updated_at = None;
+            task.waiting_on = None;
+            task.waiting_on_since = None;
             self.put(&task)?;
         }
         Ok(())
     }
 
     fn list_profiles(&self) -> Result<Vec<Profile>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table = read_txn.open_table(PROFILES_TABLE)?;
         let mut profiles: Vec<Profile> = table
             .iter()?
@@ -374,10 +455,12 @@ impl Store for RedbStore {
     }
 
     fn active_profile(&self) -> Result<Profile> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let settings = read_txn.open_table(SETTINGS_TABLE)?;
+        let key = active_profile_key(&local_owner());
         let name = settings
-            .get(ACTIVE_PROFILE_KEY)?
+            .get(key.as_str())?
             .map(|v| v.value().to_string())
             .ok_or_else(|| anyhow!("no active profile set"))?;
         let profiles = read_txn.open_table(PROFILES_TABLE)?;
@@ -386,17 +469,19 @@ impl Store for RedbStore {
     }
 
     fn use_profile(&self, name: &str) -> Result<()> {
+        let db = self.db()?;
         {
-            let read_txn = self.db.begin_read()?;
+            let read_txn = db.begin_read()?;
             let profiles = read_txn.open_table(PROFILES_TABLE)?;
             if profiles.get(name)?.is_none() {
                 bail!("no profile named '{name}'");
             }
         }
-        let write_txn = self.db.begin_write()?;
+        let write_txn = db.begin_write()?;
         {
             let mut settings = write_txn.open_table(SETTINGS_TABLE)?;
-            settings.insert(ACTIVE_PROFILE_KEY, name)?;
+            let key = active_profile_key(&local_owner());
+            settings.insert(key.as_str(), name)?;
         }
         write_txn.commit()?;
         self.touch_marker()?;
@@ -404,42 +489,19 @@ impl Store for RedbStore {
     }
 
     fn add_profile(&self, profile: Profile) -> Result<()> {
+        let db = self.db()?;
         {
-            let read_txn = self.db.begin_read()?;
+            let read_txn = db.begin_read()?;
             let table = read_txn.open_table(PROFILES_TABLE)?;
             if table.get(profile.name.as_str())?.is_some() {
                 bail!("profile '{}' already exists", profile.name);
             }
         }
         let bytes = serde_json::to_vec(&profile)?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = db.begin_write()?;
         {
             let mut table = write_txn.open_table(PROFILES_TABLE)?;
             table.insert(profile.name.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        self.touch_marker()?;
-        Ok(())
-    }
-
-    fn claude_launch_args(&self) -> Result<Option<String>> {
-        let read_txn = self.db.begin_read()?;
-        let settings = read_txn.open_table(SETTINGS_TABLE)?;
-        Ok(settings.get(CLAUDE_LAUNCH_ARGS_KEY)?.map(|v| v.value().to_string()))
-    }
-
-    fn set_claude_launch_args(&self, args: Option<String>) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut settings = write_txn.open_table(SETTINGS_TABLE)?;
-            match args {
-                Some(a) => {
-                    settings.insert(CLAUDE_LAUNCH_ARGS_KEY, a.as_str())?;
-                }
-                None => {
-                    settings.remove(CLAUDE_LAUNCH_ARGS_KEY)?;
-                }
-            }
         }
         write_txn.commit()?;
         self.touch_marker()?;
@@ -560,6 +622,36 @@ mod tests {
     }
 
     #[test]
+    fn active_profile_is_scoped_by_local_owner_not_global() {
+        let path = temp_path("active-profile-scope");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap(); // bootstraps "personal" for local_owner()
+        store
+            .add_profile(Profile { name: "other".to_string(), pillars: vec![], default_issue_system: None, phases: vec![] })
+            .unwrap();
+
+        // Plant an active-profile setting for a different owner, simulating what a
+        // shared store will eventually hold once real multi-user access exists.
+        {
+            let db = Database::create(&path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut settings = write_txn.open_table(SETTINGS_TABLE).unwrap();
+                let foreign_key = active_profile_key("someone-else");
+                settings.insert(foreign_key.as_str(), "other").unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // local_owner()'s own active profile must be unaffected by another owner's setting.
+        let active = store.active_profile().unwrap();
+        assert_eq!(active.name, "personal");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn fresh_store_bootstraps_default_personal_profile() {
         let path = temp_path("bootstrap");
         let _ = std::fs::remove_file(&path);
@@ -633,11 +725,17 @@ mod tests {
         assert_eq!(after_next.session_next, Some("draft the tech spec".to_string()));
         assert!(after_next.session_updated_at.unwrap() >= first_timestamp, "updated_at is shared across both fields");
 
-        store.set_session_phase(task.id, Some("grounding".to_string())).unwrap();
+        store.set_session_phase(task.id, Some("grounding".to_string()), false).unwrap();
         let after_phase = store.find_by_key(task.key).unwrap().unwrap();
         assert_eq!(after_phase.phase, Some("grounding".to_string()));
         assert_eq!(after_phase.session_decisions, Some("chose structured prose over a blob".to_string()), "setting phase must not touch decisions");
         assert_eq!(after_phase.session_next, Some("draft the tech spec".to_string()), "setting phase must not touch next");
+
+        store.set_waiting(task.id, Some("needs architecture input".to_string())).unwrap();
+        let after_waiting = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(after_waiting.waiting_on, Some("needs architecture input".to_string()));
+        assert!(after_waiting.waiting_on_since.is_some());
+        assert_eq!(after_waiting.phase, Some("grounding".to_string()), "setting waiting_on must not touch phase");
 
         store.clear_session(task.id).unwrap();
         let cleared = store.find_by_key(task.key).unwrap().unwrap();
@@ -645,6 +743,93 @@ mod tests {
         assert_eq!(cleared.session_decisions, None);
         assert_eq!(cleared.session_next, None);
         assert_eq!(cleared.session_updated_at, None);
+        assert_eq!(cleared.waiting_on, None);
+        assert_eq!(cleared.waiting_on_since, None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn waiting_on_round_trips_and_clear_waiting_clears_both_fields() {
+        let path = temp_path("waiting");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("might get blocked".to_string(), String::new(), vec![]).unwrap();
+
+        store.set_waiting(task.id, Some("prd needs architecture input/direction".to_string())).unwrap();
+        let blocked = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(blocked.waiting_on, Some("prd needs architecture input/direction".to_string()));
+        assert!(blocked.waiting_on_since.is_some());
+
+        store.set_waiting(task.id, None).unwrap();
+        let cleared = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(cleared.waiting_on, None);
+        assert_eq!(cleared.waiting_on_since, None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn waiting_on_alone_satisfies_the_session_show_guard() {
+        let path = temp_path("waiting-guard");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("only waiting, no other session state".to_string(), String::new(), vec![]).unwrap();
+        store.set_waiting(task.id, Some("needs a decision".to_string())).unwrap();
+
+        let reloaded = store.find_by_key(task.key).unwrap().unwrap();
+        assert!(reloaded.phase.is_none());
+        assert!(reloaded.session_decisions.is_none());
+        assert!(reloaded.session_next.is_none());
+        assert!(reloaded.claude_session_id.is_none());
+        assert!(reloaded.waiting_on.is_some(), "the CLI's no-session-state guard must treat this as having session state");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn phase_order_is_enforced_only_when_the_active_profile_configures_one() {
+        let path = temp_path("phase-order");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.add("follows a process".to_string(), String::new(), vec![]).unwrap();
+
+        // default "personal" profile has phases: [] -> unconditionally unenforced
+        store.set_session_phase(task.id, Some("anything-goes".to_string()), false).unwrap();
+
+        store
+            .add_profile(Profile {
+                name: "work".to_string(),
+                pillars: vec![],
+                default_issue_system: None,
+                phases: vec!["grounding".to_string(), "spec".to_string(), "planning".to_string()],
+            })
+            .unwrap();
+        store.use_profile("work").unwrap();
+        let task = store.add("follows senzu's process".to_string(), String::new(), vec![]).unwrap();
+
+        store.set_session_phase(task.id, Some("grounding".to_string()), false).unwrap();
+        store.set_session_phase(task.id, Some("spec".to_string()), false).unwrap();
+
+        // backward move: allowed, revisiting is rigor not a violation
+        store.set_session_phase(task.id, Some("grounding".to_string()), false).unwrap();
+        store.set_session_phase(task.id, Some("spec".to_string()), false).unwrap();
+
+        // skips "planning" straight past it (there's nothing after planning to skip to
+        // here, so instead assert skipping spec entirely from a fresh task)
+        let fresh = store.add("skips ahead".to_string(), String::new(), vec![]).unwrap();
+        let skip_err = store.set_session_phase(fresh.id, Some("planning".to_string()), false);
+        assert!(skip_err.is_err(), "grounding -> planning must skip spec and be rejected");
+        store.set_session_phase(fresh.id, Some("planning".to_string()), true).unwrap(); // --force overrides
+        let forced = store.find_by_key(fresh.key).unwrap().unwrap();
+        assert_eq!(forced.phase, Some("planning".to_string()));
+
+        let unknown_err = store.set_session_phase(task.id, Some("nonexistent".to_string()), false);
+        assert!(unknown_err.is_err(), "a phase absent from the configured list must be rejected");
+        store.set_session_phase(task.id, Some("nonexistent".to_string()), true).unwrap(); // --force overrides
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -693,23 +878,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_launch_args_round_trip_and_clear() {
-        let path = temp_path("launch-args");
-        let _ = std::fs::remove_file(&path);
-
-        let store = RedbStore::open(&path).unwrap();
-        assert_eq!(store.claude_launch_args().unwrap(), None);
-
-        store.set_claude_launch_args(Some("--dangerously-skip-permissions".to_string())).unwrap();
-        assert_eq!(store.claude_launch_args().unwrap(), Some("--dangerously-skip-permissions".to_string()));
-
-        store.set_claude_launch_args(None).unwrap();
-        assert_eq!(store.claude_launch_args().unwrap(), None);
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
     fn claude_session_id_persists_across_reopen() {
         let path = temp_path("session-id");
         let _ = std::fs::remove_file(&path);
@@ -724,6 +892,63 @@ mod tests {
         let store = RedbStore::open(&path).unwrap();
         let task = store.find_by_key(1).unwrap().unwrap();
         assert_eq!(task.claude_session_id, Some("11111111-1111-1111-1111-111111111111".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn owner_is_stamped_at_creation_and_survives_reopen() {
+        let path = temp_path("owner");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = RedbStore::open(&path).unwrap();
+            let task = store.add("has an owner".to_string(), String::new(), vec![]).unwrap();
+            assert_eq!(task.owner, local_owner());
+            assert!(!task.owner.is_empty());
+        }
+
+        let store = RedbStore::open(&path).unwrap();
+        let task = store.find_by_key(1).unwrap().unwrap();
+        assert_eq!(task.owner, local_owner());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn old_records_without_owner_default_to_empty_string() {
+        let path = temp_path("no-owner");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let mut task = store.add("predates owner".to_string(), String::new(), vec![]).unwrap();
+        task.owner = String::new(); // simulate a legacy record serialized before this field existed
+        store.put(&task).unwrap();
+
+        let reloaded = store.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(reloaded.owner, "");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The core of WAY-3: a second, independent `RedbStore::open` on the same
+    /// path must succeed and see prior writes, simulating a `way session
+    /// set-phase` CLI call made by a claude session while the spawning `way`
+    /// TUI process's own `RedbStore` handle is still alive.
+    #[test]
+    fn concurrent_opens_on_the_same_path_do_not_lock_each_other_out() {
+        let path = temp_path("concurrent-opens");
+        let _ = std::fs::remove_file(&path);
+
+        let parent = RedbStore::open(&path).unwrap();
+        let task = parent.add("obstacle".to_string(), String::new(), vec![]).unwrap();
+
+        // parent's RedbStore handle is still alive here, unlike survives_reopen
+        let child = RedbStore::open(&path).unwrap();
+        child.set_session_phase(task.id, Some("in-flight".to_string()), false).unwrap();
+
+        let seen_by_parent = parent.find_by_key(task.key).unwrap().unwrap();
+        assert_eq!(seen_by_parent.phase, Some("in-flight".to_string()));
 
         std::fs::remove_file(&path).unwrap();
     }

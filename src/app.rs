@@ -319,13 +319,6 @@ impl App {
         self.editing_id.and_then(|id| self.tasks.iter().find(|t| t.id == id)).map(|t| t.key)
     }
 
-    /// Read fresh from the store rather than caching on `App` — this is only
-    /// ever consumed at the moment a session is spawned, so there's nothing to
-    /// live-reload; just don't cache something used once per keypress.
-    pub fn claude_launch_args(&self) -> Result<Option<String>> {
-        self.store.claude_launch_args()
-    }
-
     pub fn store(&self) -> &dyn Store {
         self.store.as_ref()
     }

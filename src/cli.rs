@@ -86,32 +86,24 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
-    /// Operator-level settings for how way itself behaves
-    Config {
-        #[command(subcommand)]
-        action: ConfigCommand,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum ConfigCommand {
-    /// Extra args passed to `claude` when the TUI spawns a session
-    /// (e.g. "--dangerously-skip-permissions"). Space-separated, no quoting support.
-    SetClaudeArgs {
-        #[arg(allow_hyphen_values = true)]
-        args: String,
-    },
-    /// Show current config
-    Show,
-    /// Clear the claude launch args
-    ClearClaudeArgs,
 }
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
-    /// Set the task's phase - free-form, not tied to any one workflow's
-    /// vocabulary (e.g. "grounding", "planning", or anything else)
-    SetPhase { key: u32, phase: String },
+    /// Set the task's phase - not tied to any one workflow's vocabulary
+    /// (e.g. "grounding", "planning", or anything else), but validated
+    /// against the active profile's configured phase order when it has one
+    SetPhase {
+        key: u32,
+        phase: String,
+        /// Bypass phase-order validation
+        #[arg(long)]
+        force: bool,
+    },
+    /// Flag the task as blocked, waiting on nick, with a short reason
+    SetWaiting { key: u32, reason: String },
+    /// Clear the waiting-on-nick flag (leaves phase/decisions/next alone)
+    ClearWaiting { key: u32 },
     /// Read decisions prose from stdin and store it
     SetDecisions { key: u32 },
     /// Read next-step prose from stdin and store it
@@ -121,11 +113,12 @@ pub enum SessionCommand {
     SetClaudeId { key: u32, session_id: String },
     /// Detach the claude session id - next spawn starts a new one
     ClearClaudeId { key: u32 },
-    /// Print phase/decisions/next/updated-at/claude-session-id as labeled plain text
+    /// Print phase/decisions/next/updated-at/waiting-on/claude-session-id as
+    /// labeled plain text
     Show { key: u32 },
-    /// Clear phase, decisions, next, and updated-at together (leaves
-    /// claude-session-id alone - that's the live conversation's identity,
-    /// not a summary of it)
+    /// Clear phase, decisions, next, updated-at, and waiting-on together
+    /// (leaves claude-session-id alone - that's the live conversation's
+    /// identity, not a summary of it)
     Clear { key: u32 },
 }
 
@@ -140,6 +133,10 @@ pub enum ProfileCommand {
         name: String,
         #[arg(long)]
         pillars: String,
+        /// Ordered phase vocabulary, e.g. "grounding,spec,planning". Omit
+        /// (or leave empty) for no phase-order enforcement on this profile.
+        #[arg(long)]
+        phases: Option<String>,
     },
 }
 
@@ -314,32 +311,23 @@ pub fn run(command: Command, store: &dyn Store) -> Result<()> {
         }
         Command::Session { action } => run_session(action, store)?,
         Command::Profile { action } => run_profile(action, store)?,
-        Command::Config { action } => run_config(action, store)?,
-    }
-    Ok(())
-}
-
-fn run_config(action: ConfigCommand, store: &dyn Store) -> Result<()> {
-    match action {
-        ConfigCommand::SetClaudeArgs { args } => {
-            store.set_claude_launch_args(Some(args))?;
-        }
-        ConfigCommand::Show => {
-            let args = store.claude_launch_args()?;
-            println!("claude_launch_args: {}", args.as_deref().unwrap_or("(none)"));
-        }
-        ConfigCommand::ClearClaudeArgs => {
-            store.set_claude_launch_args(None)?;
-        }
     }
     Ok(())
 }
 
 fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
     match action {
-        SessionCommand::SetPhase { key, phase } => {
+        SessionCommand::SetPhase { key, phase, force } => {
             let task = find_by_key(store, key)?;
-            store.set_session_phase(task.id, Some(phase))?;
+            store.set_session_phase(task.id, Some(phase), force)?;
+        }
+        SessionCommand::SetWaiting { key, reason } => {
+            let task = find_by_key(store, key)?;
+            store.set_waiting(task.id, Some(reason))?;
+        }
+        SessionCommand::ClearWaiting { key } => {
+            let task = find_by_key(store, key)?;
+            store.set_waiting(task.id, None)?;
         }
         SessionCommand::SetDecisions { key } => {
             let task = find_by_key(store, key)?;
@@ -367,6 +355,7 @@ fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
                 && task.session_decisions.is_none()
                 && task.session_next.is_none()
                 && task.claude_session_id.is_none()
+                && task.waiting_on.is_none()
             {
                 bail!("no session state for WAY-{key}");
             }
@@ -378,6 +367,12 @@ fn run_session(action: SessionCommand, store: &dyn Store) -> Result<()> {
             }
             if let Some(next) = &task.session_next {
                 println!("next:\n{next}\n");
+            }
+            if let Some(reason) = &task.waiting_on {
+                println!("waiting_on: {reason}");
+                if let Some(since) = task.waiting_on_since {
+                    println!("waiting_on_since (unix seconds): {since}\n");
+                }
             }
             if let Some(updated_at) = task.session_updated_at {
                 println!("updated_at (unix seconds): {updated_at}");
@@ -400,9 +395,10 @@ fn run_profile(action: ProfileCommand, store: &dyn Store) -> Result<()> {
         ProfileCommand::Use { name } => {
             store.use_profile(&name)?;
         }
-        ProfileCommand::Add { name, pillars } => {
+        ProfileCommand::Add { name, pillars, phases } => {
             let pillars = parse_pillar_spec(&pillars)?;
-            store.add_profile(Profile { name, pillars, default_issue_system: None })?;
+            let phases = split_tags(phases);
+            store.add_profile(Profile { name, pillars, default_issue_system: None, phases })?;
         }
     }
     Ok(())

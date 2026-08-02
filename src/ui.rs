@@ -89,12 +89,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::FG)
             };
 
+            let waiting = if task.waiting_on.is_some() { "● " } else { "  " };
             let key = format!("WAY-{} ", task.key);
             let mut spans = vec![
+                Span::styled(waiting, Style::default().fg(theme::RED)),
                 Span::styled(key.clone(), Style::default().fg(theme::DIM)),
                 Span::styled(format!("{mark} "), Style::default().fg(mark_color)),
             ];
-            let mut prefix_len = key.chars().count() + mark.chars().count() + 1;
+            let mut prefix_len = waiting.chars().count() + key.chars().count() + mark.chars().count() + 1;
             if let Some(pillar) = &task.pillar
                 && let Some(def) = find_pillar_def(app, pillar)
             {
@@ -237,6 +239,14 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 format!("{phase} · {when} · next: {}", truncate(preview, 48)),
                 Style::default().fg(theme::ORANGE),
             ),
+        ]));
+    }
+
+    if let Some(reason) = &task.waiting_on {
+        let since = task.waiting_on_since.map(relative_time).unwrap_or_default();
+        text.push(Line::from(vec![
+            Span::styled(format!("{:<8}", "WAITING"), Style::default().fg(theme::DIM)),
+            Span::styled(format!("{reason} · {since}"), Style::default().fg(theme::RED)),
         ]));
     }
 
