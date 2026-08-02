@@ -4,11 +4,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
 use crate::app::{App, ConfirmKind, Field, Mode, View};
+use crate::backlog::BacklogRef;
+use crate::craft::CraftStatus;
+use crate::journal::JournalEntryKind;
+use crate::person::RelationshipKind;
+use crate::stability::StabilityStatus;
 use crate::task::PillarDef;
 use crate::theme;
 
@@ -37,115 +42,180 @@ fn relative_time(unix_seconds: i64) -> String {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(outer[1]);
-
     draw_header(frame, app, outer[0]);
-    draw_list(frame, app, main[0]);
-    draw_detail(frame, app, main[1]);
-    draw_bottom(frame, app, outer[2]);
+    if let Mode::Editing(field) = app.mode {
+        draw_edit_form(frame, app, outer[1], field);
+    } else {
+        draw_backlog(frame, app, outer[1]);
+        if let Mode::Detail = app.mode {
+            draw_detail_popup(frame, app, outer[1]);
+        }
+    }
+    draw_status_line(frame, app, outer[2]);
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let open = app.tasks.iter().filter(|t| !t.done).count();
-    let done = app.tasks.iter().filter(|t| t.done).count();
     let summary = match app.view {
-        View::Active => format!("everyday · {open} open · {done} done"),
-        View::Archived => format!("everyday — archived · {} item{}", app.tasks.len(), if app.tasks.len() == 1 { "" } else { "s" }),
+        View::Active => {
+            let open = app.tasks.iter().filter(|t| !t.done).count();
+            format!(
+                "way › backlog   {open} open obstacle{}  ·  {} across {} pillars",
+                if open == 1 { "" } else { "s" },
+                app.backlog.len(),
+                6
+            )
+        }
+        View::Archived => format!("way › archived   {} obstacle{}", app.tasks.len(), if app.tasks.len() == 1 { "" } else { "s" }),
     };
-    let header = Paragraph::new(Span::styled(summary, Style::default().fg(theme::DIM))).block(titled(theme::GREEN, "way".to_string()));
-    frame.render_widget(header, area);
+    frame.render_widget(Paragraph::new(Span::styled(summary, Style::default().fg(theme::DIM))), area);
+}
+
+fn kind_glyph(r: BacklogRef, app: &App) -> (&'static str, Color) {
+    match r {
+        BacklogRef::Task(i) => {
+            let task = &app.tasks[i];
+            if task.done { ("✓", theme::GREEN) } else { ("▸", theme::ORANGE) }
+        }
+        BacklogRef::Journal(_) => ("j", pillar_color(app, "mind")),
+        BacklogRef::Routine(_) => ("r", pillar_color(app, "body")),
+        BacklogRef::Person(_) => ("p", pillar_color(app, "relationships")),
+        BacklogRef::Craft(_) => ("k", pillar_color(app, "craft")),
+        BacklogRef::Stability(_) => ("s", pillar_color(app, "stability")),
+        BacklogRef::Principle(_) => ("P", pillar_color(app, "purpose")),
+    }
+}
+
+fn pillar_color(app: &App, name: &str) -> Color {
+    find_pillar_def(app, name).map(pillar_def_color).unwrap_or(theme::FG)
+}
+
+fn row_title(r: BacklogRef, app: &App) -> String {
+    match r {
+        BacklogRef::Task(i) => app.tasks[i].title.clone(),
+        BacklogRef::Journal(i) => {
+            let entry = &app.journal[i];
+            let kind = match entry.kind {
+                JournalEntryKind::Freeform => "",
+                JournalEntryKind::CheckIn => "check-in: ",
+            };
+            let first_line = entry.content.lines().next().unwrap_or("").trim();
+            format!("{kind}{first_line}")
+        }
+        BacklogRef::Routine(i) => app.routines[i].name.clone(),
+        BacklogRef::Person(i) => app.people[i].name.clone(),
+        BacklogRef::Craft(i) => app.crafts[i].name.clone(),
+        BacklogRef::Stability(i) => app.stability[i].name.clone(),
+        BacklogRef::Principle(i) => truncate(app.principles[i].text.as_str(), 60),
+    }
+}
+
+fn row_meta(r: BacklogRef, app: &App) -> String {
+    match r {
+        BacklogRef::Task(i) => {
+            let task = &app.tasks[i];
+            let mut meta = format!("WAY-{}", task.key);
+            if task.waiting_on.is_some() {
+                meta.push_str(" · waiting");
+            }
+            meta
+        }
+        BacklogRef::Journal(i) => relative_time(app.journal[i].created_at),
+        BacklogRef::Routine(i) => format!("{} exercise{}", app.routines[i].exercises.len(), if app.routines[i].exercises.len() == 1 { "" } else { "s" }),
+        BacklogRef::Person(i) => match app.people[i].relationship {
+            RelationshipKind::Child => "child".to_string(),
+            RelationshipKind::Partner => "partner".to_string(),
+        },
+        BacklogRef::Craft(i) => status_label(app.crafts[i].status),
+        BacklogRef::Stability(i) => status_label_stability(app.stability[i].status),
+        BacklogRef::Principle(i) => relative_time(app.principles[i].created_at),
+    }
+}
+
+fn row_pillar_chip(r: BacklogRef, app: &App) -> Option<(String, Color)> {
+    match r {
+        BacklogRef::Task(i) => {
+            let pillar = app.tasks[i].pillar.as_deref()?;
+            let def = find_pillar_def(app, pillar)?;
+            Some((def.name.clone(), pillar_def_color(def)))
+        }
+        BacklogRef::Journal(_) => Some(("mind".to_string(), pillar_color(app, "mind"))),
+        BacklogRef::Routine(_) => Some(("body".to_string(), pillar_color(app, "body"))),
+        BacklogRef::Person(_) => Some(("relationships".to_string(), pillar_color(app, "relationships"))),
+        BacklogRef::Craft(_) => Some(("craft".to_string(), pillar_color(app, "craft"))),
+        BacklogRef::Stability(_) => Some(("stability".to_string(), pillar_color(app, "stability"))),
+        BacklogRef::Principle(_) => Some(("purpose".to_string(), pillar_color(app, "purpose"))),
+    }
+}
+
+fn status_label(s: CraftStatus) -> String {
+    match s {
+        CraftStatus::Active => "active".to_string(),
+        CraftStatus::Dormant => "dormant".to_string(),
+        CraftStatus::Historical => "historical".to_string(),
+    }
+}
+
+fn status_label_stability(s: StabilityStatus) -> String {
+    match s {
+        StabilityStatus::Active => "active".to_string(),
+        StabilityStatus::Dormant => "dormant".to_string(),
+        StabilityStatus::Historical => "historical".to_string(),
+    }
 }
 
 fn rounded(border_color: Color) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
+    Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(border_color))
 }
 
-fn titled(border_color: Color, title: String) -> Block<'static> {
-    rounded(border_color).title(Span::styled(
-        title,
-        Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
-    ))
-}
-
-fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
-    let inner_width = area.width.saturating_sub(2) as usize; // borders only, prefix computed per row
+fn draw_backlog(frame: &mut Frame, app: &App, area: Rect) {
+    let inner_width = area.width as usize;
     let items: Vec<ListItem> = app
-        .tasks
+        .backlog
         .iter()
-        .map(|task| {
-            let (mark, mark_color) = if task.done { ("✓", theme::GREEN) } else { ("▸", theme::ORANGE) };
-            let title_style = if task.done {
-                Style::default().fg(theme::DIM)
-            } else {
-                Style::default().fg(theme::FG)
-            };
+        .map(|&r| {
+            let (glyph, glyph_color) = kind_glyph(r, app);
+            let title = row_title(r, app);
+            let meta = row_meta(r, app);
 
-            let waiting = if task.waiting_on.is_some() { "● " } else { "  " };
-            let key = format!("WAY-{} ", task.key);
-            let mut spans = vec![
-                Span::styled(waiting, Style::default().fg(theme::RED)),
-                Span::styled(key.clone(), Style::default().fg(theme::DIM)),
-                Span::styled(format!("{mark} "), Style::default().fg(mark_color)),
-            ];
-            let mut prefix_len = waiting.chars().count() + key.chars().count() + mark.chars().count() + 1;
-            if let Some(pillar) = &task.pillar
-                && let Some(def) = find_pillar_def(app, pillar)
-            {
-                let tag = format!("[{}] ", def.glyph);
-                prefix_len += tag.chars().count();
-                spans.push(Span::styled(tag, Style::default().fg(pillar_def_color(def))));
+            let mut spans = vec![Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color))];
+            let mut prefix_len = 3;
+
+            if let Some((label, color)) = row_pillar_chip(r, app) {
+                let chip = format!("[{label}] ");
+                prefix_len += chip.chars().count();
+                spans.push(Span::styled(chip, Style::default().fg(color)));
             }
 
-            let title = truncate(&task.title, inner_width.saturating_sub(prefix_len));
-            spans.push(Span::styled(title, title_style));
+            let title_style = match r {
+                BacklogRef::Task(i) if app.tasks[i].done => Style::default().fg(theme::DIM),
+                _ => Style::default().fg(theme::FG),
+            };
+            let budget = inner_width.saturating_sub(prefix_len + meta.chars().count() + 2);
+            spans.push(Span::styled(format!("{:<width$}", truncate(&title, budget), width = budget), title_style));
+            spans.push(Span::styled(format!("  {meta}"), Style::default().fg(theme::DIM)));
+
             ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let title = match app.view {
-        View::Active => format!("way / everyday ({}/{})", position(app), app.tasks.len()),
-        View::Archived => format!("way / everyday — archived ({}/{})", position(app), app.tasks.len()),
-    };
-    let border_color = match app.view {
-        View::Active => theme::GREEN,
-        View::Archived => theme::DIM,
-    };
-
-    let list = List::new(items)
-        .block(titled(border_color, title))
-        .highlight_style(
-            Style::default()
-                .bg(theme::SELECT_BG)
-                .fg(theme::FG)
-                .add_modifier(Modifier::BOLD),
-        );
+    let list = List::new(items).highlight_symbol("▎").highlight_style(Style::default().fg(theme::FG).add_modifier(Modifier::BOLD));
 
     let mut state = ListState::default();
-    if !app.tasks.is_empty() {
+    if !app.backlog.is_empty() {
         state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, area, &mut state);
-}
 
-fn position(app: &App) -> usize {
-    if app.tasks.is_empty() {
-        0
-    } else {
-        app.selected + 1
+    if app.backlog.is_empty() {
+        let message = match app.view {
+            View::Active => "no obstacles yet — press 'a' to add",
+            View::Archived => "nothing archived",
+        };
+        frame.render_widget(Paragraph::new(Span::styled(message, Style::default().fg(theme::DIM))), area);
     }
-}
-
-fn multiline(s: &str, style: Style) -> Vec<Line<'static>> {
-    s.split('\n').map(|line| Line::from(Span::styled(line.to_string(), style))).collect()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -157,34 +227,171 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
-    if let Mode::Editing(field) = app.mode {
-        draw_edit_form(frame, app, area, field);
-        return;
+fn multiline(s: &str, style: Style) -> Vec<Line<'static>> {
+    s.split('\n').map(|line| Line::from(Span::styled(line.to_string(), style))).collect()
+}
+
+fn label(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD))
+}
+
+fn bar(value: f32, width: usize) -> String {
+    let filled = ((value.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Bespoke rendering per entity kind - each pillar's own shape, not one
+/// generic wrapped-text box. Validated across the TUI-prototype rounds
+/// (`prototype/tui-variants`) before landing here.
+fn detail_lines(r: BacklogRef, app: &App) -> Vec<Line<'static>> {
+    match r {
+        BacklogRef::Task(i) => task_detail_lines(app, &app.tasks[i]),
+
+        BacklogRef::Journal(i) => {
+            let entry = &app.journal[i];
+            let kind = match entry.kind {
+                JournalEntryKind::Freeform => "freeform",
+                JournalEntryKind::CheckIn => "check-in",
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {} ", kind), Style::default().bg(pillar_color(app, "mind")).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+            ];
+            lines.extend(multiline(&entry.content, Style::default().fg(theme::FG)));
+            lines
+        }
+
+        BacklogRef::Routine(i) => {
+            let routine = &app.routines[i];
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!("~{}s total · avg intensity {:.1} · avg friction {:.1}", routine.duration_secs(), routine.intensity(), routine.friction()),
+                    Style::default().fg(theme::DIM),
+                )),
+                Line::from(""),
+            ];
+            for e in &routine.exercises {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:<12}", e.name), Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}x{}", e.sets, e.reps), Style::default().fg(theme::DIM)),
+                    Span::styled(format!("  {}s", e.duration_secs), Style::default().fg(theme::DIM)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    label("int "),
+                    Span::styled(bar(e.intensity, 12), Style::default().fg(theme::ORANGE)),
+                    Span::raw("  "),
+                    label("fric "),
+                    Span::styled(bar(e.friction, 12), Style::default().fg(theme::AQUA)),
+                ]));
+                lines.push(Line::from(""));
+            }
+            if routine.exercises.is_empty() {
+                lines.push(Line::from(Span::styled("(no exercises yet)", Style::default().fg(theme::DIM))));
+            }
+            lines
+        }
+
+        BacklogRef::Person(i) => {
+            let person = &app.people[i];
+            let relationship = match person.relationship {
+                RelationshipKind::Child => "child",
+                RelationshipKind::Partner => "partner",
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {relationship} "), Style::default().bg(pillar_color(app, "relationships")).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+            ];
+            if !person.hobbies.is_empty() {
+                lines.push(Line::from(label("HOBBIES")));
+                lines.push(Line::from(person.hobbies.iter().map(|h| Span::styled(format!("[{h}] "), Style::default().fg(theme::AQUA))).collect::<Vec<_>>()));
+                lines.push(Line::from(""));
+            }
+            if !person.dreams_aspirations.is_empty() {
+                lines.push(Line::from(label("DREAMS")));
+                lines.push(Line::from(person.dreams_aspirations.iter().map(|d| Span::styled(format!("[{d}] "), Style::default().fg(theme::GREEN))).collect::<Vec<_>>()));
+                lines.push(Line::from(""));
+            }
+            if !person.preferences.is_empty() {
+                lines.push(Line::from(label("PREFERENCES")));
+                for (k, v) in &person.preferences {
+                    lines.push(Line::from(Span::styled(format!("{k}: {v}"), Style::default().fg(theme::FG))));
+                }
+                lines.push(Line::from(""));
+            }
+            if !person.attention_areas.is_empty() {
+                lines.push(Line::from(label("ATTENTION")));
+                for a in &person.attention_areas {
+                    lines.push(Line::from(Span::styled(a.clone(), Style::default().fg(theme::RED))));
+                }
+                lines.push(Line::from(""));
+            }
+            if !person.notes.is_empty() {
+                lines.push(Line::from(label("NOTES")));
+                lines.extend(multiline(&person.notes, Style::default().fg(theme::FG)));
+            }
+            lines
+        }
+
+        BacklogRef::Craft(i) => {
+            let craft = &app.crafts[i];
+            let (status_text, status_color) = match craft.status {
+                CraftStatus::Active => ("active", theme::GREEN),
+                CraftStatus::Dormant => ("dormant", theme::ORANGE),
+                CraftStatus::Historical => ("historical", theme::DIM),
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {} ", status_text.to_uppercase()), Style::default().bg(status_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+            ];
+            if !craft.space.is_empty() {
+                lines.push(Line::from(label("SPACE")));
+                lines.extend(multiline(&craft.space, Style::default().fg(theme::FG)));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(label("STANDING")));
+            lines.extend(multiline(if craft.standing.is_empty() { "(none yet)" } else { &craft.standing }, Style::default().fg(theme::FG)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(label("TRAJECTORY")));
+            lines.extend(multiline(if craft.trajectory.is_empty() { "(none yet)" } else { &craft.trajectory }, Style::default().fg(theme::FG)));
+            lines
+        }
+
+        BacklogRef::Stability(i) => {
+            let area = &app.stability[i];
+            let (status_text, status_color) = match area.status {
+                StabilityStatus::Active => ("active", theme::GREEN),
+                StabilityStatus::Dormant => ("dormant", theme::ORANGE),
+                StabilityStatus::Historical => ("historical", theme::DIM),
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {} ", status_text.to_uppercase()), Style::default().bg(status_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+                Line::from(label("STANDING")),
+            ];
+            lines.extend(multiline(if area.standing.is_empty() { "(none yet)" } else { &area.standing }, Style::default().fg(theme::FG)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(label("TRAJECTORY")));
+            lines.extend(multiline(if area.trajectory.is_empty() { "(none yet)" } else { &area.trajectory }, Style::default().fg(theme::FG)));
+            lines
+        }
+
+        BacklogRef::Principle(i) => {
+            let principle = &app.principles[i];
+            let mut lines = vec![Line::from(Span::styled("  “", Style::default().fg(pillar_color(app, "purpose")).add_modifier(Modifier::BOLD)))];
+            for l in principle.text.lines() {
+                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::FG).add_modifier(Modifier::ITALIC))));
+            }
+            lines.push(Line::from(Span::styled("  ”", Style::default().fg(pillar_color(app, "purpose")).add_modifier(Modifier::BOLD))));
+            lines
+        }
     }
+}
 
-    let Some(task) = app.tasks.get(app.selected) else {
-        let message = match app.view {
-            View::Active => "no tasks yet — press 'a' to add",
-            View::Archived => "nothing archived",
-        };
-        let empty = Paragraph::new(Span::styled(message, Style::default().fg(theme::DIM))).block(titled(theme::DIM, "details".to_string()));
-        frame.render_widget(empty, area);
-        return;
-    };
-    let block = titled(theme::DIM, format!("WAY-{}", task.key));
-
+fn task_detail_lines(app: &App, task: &crate::task::Task) -> Vec<Line<'static>> {
     let (status, status_color) = if task.done { ("done", theme::GREEN) } else { ("open", theme::ORANGE) };
-    let tags = if task.tags.is_empty() {
-        "(none)".to_string()
-    } else {
-        task.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")
-    };
-    let description = if task.description.is_empty() {
-        "(none)"
-    } else {
-        task.description.as_str()
-    };
+    let tags = if task.tags.is_empty() { "(none)".to_string() } else { task.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ") };
+    let description = if task.description.is_empty() { "(none)" } else { task.description.as_str() };
     let (pillar_label, pillar_style) = match &task.pillar {
         Some(name) => match find_pillar_def(app, name) {
             Some(def) => (def.name.clone(), Style::default().fg(pillar_def_color(def))),
@@ -192,34 +399,16 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         None => ("(unassigned — press 'p')".to_string(), Style::default().fg(theme::DIM)),
     };
-
     let refs = if task.external_refs.is_empty() { "(none)".to_string() } else { task.external_refs.join(", ") };
 
     let mut text = vec![
-        Line::from(Span::styled(
-            task.title.clone(),
-            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::styled(format!("{:<8}", "STATUS"), Style::default().fg(theme::DIM)),
-            Span::styled(
-                format!(" {} ", status.to_uppercase()),
-                Style::default().bg(status_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!(" {} ", status.to_uppercase()), Style::default().bg(status_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![
-            Span::styled(format!("{:<8}", "PILLAR"), Style::default().fg(theme::DIM)),
-            Span::styled(pillar_label, pillar_style),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{:<8}", "TAGS"), Style::default().fg(theme::DIM)),
-            Span::styled(tags, Style::default().fg(theme::AQUA)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{:<8}", "REFS"), Style::default().fg(theme::DIM)),
-            Span::styled(refs, Style::default().fg(theme::AQUA)),
-        ]),
+        Line::from(vec![Span::styled(format!("{:<8}", "PILLAR"), Style::default().fg(theme::DIM)), Span::styled(pillar_label, pillar_style)]),
+        Line::from(vec![Span::styled(format!("{:<8}", "TAGS"), Style::default().fg(theme::DIM)), Span::styled(tags, Style::default().fg(theme::AQUA))]),
+        Line::from(vec![Span::styled(format!("{:<8}", "REFS"), Style::default().fg(theme::DIM)), Span::styled(refs, Style::default().fg(theme::AQUA))]),
     ];
 
     if let Some(parent_key) = task.parent_key {
@@ -235,10 +424,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         let preview = task.session_next.as_deref().unwrap_or("(no next step recorded)");
         text.push(Line::from(vec![
             Span::styled(format!("{:<8}", "SESSION"), Style::default().fg(theme::DIM)),
-            Span::styled(
-                format!("{phase} · {when} · next: {}", truncate(preview, 48)),
-                Style::default().fg(theme::ORANGE),
-            ),
+            Span::styled(format!("{phase} · {when} · next: {}", truncate(preview, 48)), Style::default().fg(theme::ORANGE)),
         ]));
     }
 
@@ -252,17 +438,48 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
     text.push(Line::from(""));
     text.extend(multiline(description, Style::default().fg(theme::FG)));
+    text
+}
 
-    let detail = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
-    frame.render_widget(detail, area);
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage((100 - pct_y) / 2), Constraint::Percentage(pct_y), Constraint::Percentage((100 - pct_y) / 2)])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage((100 - pct_x) / 2), Constraint::Percentage(pct_x), Constraint::Percentage((100 - pct_x) / 2)])
+        .split(vert[1])[1]
+}
+
+fn draw_detail_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(&r) = app.backlog.get(app.selected) else { return };
+    let (glyph, glyph_color) = kind_glyph(r, app);
+    let title = row_title(r, app);
+
+    let popup = centered_rect(area, 78, 75);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(glyph_color))
+        .title(Line::from(vec![
+            Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color).add_modifier(Modifier::BOLD)),
+            Span::styled(truncate(&title, popup.width.saturating_sub(8) as usize), Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+        ]));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let padded = Rect { x: inner.x + 1, y: inner.y, width: inner.width.saturating_sub(2), height: inner.height };
+    frame.render_widget(Paragraph::new(detail_lines(r, app)).wrap(Wrap { trim: false }), padded);
 }
 
 fn draw_edit_form(frame: &mut Frame, app: &mut App, area: Rect, field: Field) {
     let heading = match app.editing_key() {
         Some(key) => format!("editing WAY-{key}"),
-        None => "new task".to_string(),
+        None => "new obstacle".to_string(),
     };
-    let block = titled(theme::AQUA, heading);
+    let block = rounded(theme::AQUA).title(Span::styled(heading, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -288,41 +505,17 @@ fn draw_edit_form(frame: &mut Frame, app: &mut App, area: Rect, field: Field) {
         ])
         .split(inner);
 
-    let editor_theme = || {
-        edtui::EditorTheme::default()
-            .base(Style::default().fg(theme::FG))
-            .hide_status_line()
-            .cursor_style(Style::default().bg(theme::FG).fg(theme::SELECT_BG))
-    };
+    let editor_theme = || edtui::EditorTheme::default().base(Style::default().fg(theme::FG)).hide_status_line().cursor_style(Style::default().bg(theme::FG).fg(theme::SELECT_BG));
 
     frame.render_widget(Paragraph::new(Span::styled("title", field_label_style(Field::Title))), rows[0]);
-    frame.render_widget(
-        edtui::EditorView::new(&mut app.title_editor).theme(editor_theme()).single_line(true).wrap(false),
-        rows[1],
-    );
+    frame.render_widget(edtui::EditorView::new(&mut app.title_editor).theme(editor_theme()).single_line(true).wrap(false), rows[1]);
 
-    frame.render_widget(
-        Paragraph::new(Span::styled("description", field_label_style(Field::Description))),
-        rows[3],
-    );
-    frame.render_widget(
-        edtui::EditorView::new(&mut app.description_editor).theme(editor_theme()).wrap(true),
-        rows[4],
-    );
+    frame.render_widget(Paragraph::new(Span::styled("description", field_label_style(Field::Description))), rows[3]);
+    frame.render_widget(edtui::EditorView::new(&mut app.description_editor).theme(editor_theme()).wrap(true), rows[4]);
 
-    let mut tags_spans: Vec<Span> = app
-        .draft_tags
-        .iter()
-        .map(|t| Span::styled(format!("#{t} "), Style::default().fg(theme::AQUA)))
-        .collect();
+    let mut tags_spans: Vec<Span> = app.draft_tags.iter().map(|t| Span::styled(format!("#{t} "), Style::default().fg(theme::AQUA))).collect();
     tags_spans.push(Span::styled(app.tag_input.clone(), Style::default().fg(theme::FG)));
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "tags (enter/comma to add, backspace to remove)",
-            field_label_style(Field::Tags),
-        )),
-        rows[6],
-    );
+    frame.render_widget(Paragraph::new(Span::styled("tags (enter/comma to add, backspace to remove)", field_label_style(Field::Tags))), rows[6]);
     frame.render_widget(Paragraph::new(Line::from(tags_spans)), rows[7]);
 
     match field {
@@ -345,48 +538,59 @@ fn draw_edit_form(frame: &mut Frame, app: &mut App, area: Rect, field: Field) {
     }
 }
 
-fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
-    let (border_color, content) = match app.mode {
-        Mode::Normal => (
-            theme::DIM,
-            Line::from(Span::styled(
-                match app.view {
-                    View::Active => "a add  e edit  s status  t tags  p pillar  c claude  d archive  A archived  j/k move  q quit",
-                    View::Archived => "c claude  d restore  A active  j/k move  q quit",
-                },
-                Style::default().fg(theme::DIM),
-            )),
-        ),
-        Mode::Editing(field) => (
-            theme::AQUA,
-            Line::from(Span::styled(
-                match field {
-                    Field::Tags => "type + enter/,: add tag   backspace (empty): remove last   tab: field   ctrl+s save   esc/ctrl+c cancel",
-                    Field::Title | Field::Description => {
-                        "arrow keys to move   tab/shift+tab: field   ctrl+s: save   esc/ctrl+c: cancel"
-                    }
-                },
-                Style::default().fg(theme::DIM),
-            )),
-        ),
+/// Helix-inspired: a mode badge (left, colored block) + short contextual
+/// hint + position (right) - replacing the old always-visible full
+/// keybinding legend. Validated across the TUI-prototype rounds.
+fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
+    let pos = if app.backlog.is_empty() { "0/0".to_string() } else { format!("{}/{}", app.selected + 1, app.backlog.len()) };
+
+    let (badge_text, badge_color, hint): (&str, Color, &str) = match app.mode {
+        Mode::Normal => match app.view {
+            View::Active => {
+                if app.selected_task().is_some() {
+                    ("NORMAL", theme::GREEN, "j/k move  enter detail  a add  e edit  t tags  s status  p pillar  d archive  c claude  A archived  q quit")
+                } else {
+                    ("NORMAL", theme::GREEN, "j/k move  enter detail  a add  A archived  q quit  (mutations for this kind: CLI only, for now)")
+                }
+            }
+            View::Archived => ("NORMAL", theme::GREEN, "j/k move  enter detail  c claude  d restore  A active  q quit"),
+        },
+        Mode::Detail => ("DETAIL", theme::AQUA, "j/k move  enter/esc/q close"),
+        Mode::Editing(Field::Tags) => ("EDIT", theme::AQUA, "type + enter/,: add tag   backspace (empty): remove last   tab: field   ctrl+s save   esc cancel"),
+        Mode::Editing(_) => ("EDIT", theme::AQUA, "arrow keys to move   tab/shift+tab: field   ctrl+s: save   esc: cancel"),
         Mode::Confirm(kind) => {
             let color = match kind {
                 ConfirmKind::Archive => theme::RED,
                 ConfirmKind::Restore => theme::GREEN,
             };
-            (
-                color,
-                Line::from(Span::styled(
-                    confirm_prompt(app, kind),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )),
-            )
+            let badge = match kind {
+                ConfirmKind::Archive => "ARCHIVE?",
+                ConfirmKind::Restore => "RESTORE?",
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!(" {badge} "), Style::default().bg(color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {}  ", confirm_prompt(app)), Style::default().fg(color)),
+                    Span::styled("y/enter confirm  n/esc cancel", Style::default().fg(theme::DIM)),
+                ])),
+                area,
+            );
+            return;
         }
-        Mode::PillarPick => (theme::FG, pillar_pick_line(app)),
+        Mode::PillarPick => {
+            frame.render_widget(Paragraph::new(pillar_pick_line(app)), area);
+            return;
+        }
     };
 
-    let bottom = Paragraph::new(content).block(rounded(border_color));
-    frame.render_widget(bottom, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {badge_text} "), Style::default().bg(badge_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {hint}   "), Style::default().fg(theme::DIM)),
+            Span::styled(pos, Style::default().fg(theme::DIM)),
+        ])),
+        area,
+    );
 }
 
 fn pillar_pick_line(app: &App) -> Line<'static> {
@@ -399,13 +603,9 @@ fn pillar_pick_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn confirm_prompt(app: &App, kind: ConfirmKind) -> String {
-    let verb = match kind {
-        ConfirmKind::Archive => "archive",
-        ConfirmKind::Restore => "restore",
-    };
-    match app.tasks.get(app.selected) {
-        Some(task) => format!("{verb} \"{}\"? (y/n)", task.title),
+fn confirm_prompt(app: &App) -> String {
+    match app.selected_task() {
+        Some(task) => format!("\"{}\"?", task.title),
         None => String::new(),
     }
 }

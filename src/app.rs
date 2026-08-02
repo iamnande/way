@@ -2,6 +2,13 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 
+use crate::backlog::BacklogRef;
+use crate::craft::Craft;
+use crate::journal::JournalEntry;
+use crate::person::Person;
+use crate::principle::Principle;
+use crate::routine::Routine;
+use crate::stability::StabilityArea;
 use crate::store::Store;
 use crate::task::{Profile, Task};
 
@@ -54,11 +61,21 @@ pub enum Mode {
     Editing(Field),
     Confirm(ConfirmKind),
     PillarPick,
+    Detail,
 }
 
 pub struct App {
     store: Box<dyn Store>,
     pub tasks: Vec<Task>,
+    pub journal: Vec<JournalEntry>,
+    pub routines: Vec<Routine>,
+    pub people: Vec<Person>,
+    pub crafts: Vec<Craft>,
+    pub stability: Vec<StabilityArea>,
+    pub principles: Vec<Principle>,
+    /// The unified, flat, selectable sequence rendered in the list pane -
+    /// active-view only (archived stays task-only, see `refresh`).
+    pub backlog: Vec<BacklogRef>,
     pub selected: usize,
     pub mode: Mode,
     pub view: View,
@@ -75,11 +92,17 @@ pub struct App {
 
 impl App {
     pub fn new(store: Box<dyn Store>) -> Result<Self> {
-        let tasks = store.list()?;
         let active_profile = store.active_profile()?;
-        Ok(Self {
+        let mut app = Self {
             store,
-            tasks,
+            tasks: Vec::new(),
+            journal: Vec::new(),
+            routines: Vec::new(),
+            people: Vec::new(),
+            crafts: Vec::new(),
+            stability: Vec::new(),
+            principles: Vec::new(),
+            backlog: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
             view: View::Active,
@@ -92,7 +115,9 @@ impl App {
             editing_id: None,
             should_quit: false,
             pending_spawn: None,
-        })
+        };
+        app.refresh()?;
+        Ok(app)
     }
 
     pub fn refresh(&mut self) -> Result<()> {
@@ -100,10 +125,66 @@ impl App {
             View::Active => self.store.list()?,
             View::Archived => self.store.list_archived()?,
         };
-        if self.selected >= self.tasks.len() && !self.tasks.is_empty() {
-            self.selected = self.tasks.len() - 1;
+
+        self.backlog.clear();
+        for i in 0..self.tasks.len() {
+            self.backlog.push(BacklogRef::Task(i));
+        }
+
+        // Archived view stays task-only, matching the pre-existing archive
+        // browse flow exactly - other entity kinds have no archived state
+        // exposed here yet (craft/stability use `status`, routine has its
+        // own archive that isn't surfaced in this view).
+        if self.view == View::Active {
+            self.journal = self.store.list_journal_entries()?;
+            self.routines = self.store.list_routines()?;
+            self.people = self.store.list_people()?;
+            self.crafts = self.store.list_crafts(None)?;
+            self.stability = self.store.list_stability_areas(None)?;
+            self.principles = self.store.list_principles()?;
+
+            for i in 0..self.journal.len() {
+                self.backlog.push(BacklogRef::Journal(i));
+            }
+            for i in 0..self.routines.len() {
+                self.backlog.push(BacklogRef::Routine(i));
+            }
+            for i in 0..self.people.len() {
+                self.backlog.push(BacklogRef::Person(i));
+            }
+            for i in 0..self.crafts.len() {
+                self.backlog.push(BacklogRef::Craft(i));
+            }
+            for i in 0..self.stability.len() {
+                self.backlog.push(BacklogRef::Stability(i));
+            }
+            for i in 0..self.principles.len() {
+                self.backlog.push(BacklogRef::Principle(i));
+            }
+        } else {
+            self.journal.clear();
+            self.routines.clear();
+            self.people.clear();
+            self.crafts.clear();
+            self.stability.clear();
+            self.principles.clear();
+        }
+
+        if self.selected >= self.backlog.len() && !self.backlog.is_empty() {
+            self.selected = self.backlog.len() - 1;
         }
         Ok(())
+    }
+
+    /// `Some` only when the current selection is a `Task` row - every
+    /// existing task-mutation keybinding (add aside) is scoped to this,
+    /// since the other six entity kinds are CLI-only for now (each
+    /// pillar's own PRD decision).
+    pub fn selected_task(&self) -> Option<&Task> {
+        match self.backlog.get(self.selected) {
+            Some(BacklogRef::Task(i)) => self.tasks.get(*i),
+            _ => None,
+        }
     }
 
     pub fn on_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Result<()> {
@@ -112,6 +193,7 @@ impl App {
             Mode::Editing(field) => self.on_key_editing(field, key, modifiers)?,
             Mode::Confirm(kind) => self.on_key_confirm(kind, key)?,
             Mode::PillarPick => self.on_key_pillar_pick(key)?,
+            Mode::Detail => self.on_key_detail(key)?,
         }
         Ok(())
     }
@@ -138,7 +220,7 @@ impl App {
             KeyCode::Char('e') if self.view == View::Active => self.start_edit(Field::Title),
             KeyCode::Char('t') if self.view == View::Active => self.start_edit(Field::Tags),
             KeyCode::Char('d') => {
-                if !self.tasks.is_empty() {
+                if self.selected_task().is_some() || self.view == View::Archived {
                     self.mode = Mode::Confirm(match self.view {
                         View::Active => ConfirmKind::Archive,
                         View::Archived => ConfirmKind::Restore,
@@ -146,20 +228,41 @@ impl App {
                 }
             }
             KeyCode::Char('p') if self.view == View::Active => {
-                if !self.tasks.is_empty() {
+                if self.selected_task().is_some() {
                     self.mode = Mode::PillarPick;
                 }
             }
-            KeyCode::Char('s') | KeyCode::Char(' ') | KeyCode::Enter if self.view == View::Active => {
+            KeyCode::Char('s') if self.view == View::Active => {
                 self.toggle_selected()?;
             }
             KeyCode::Char('c') => {
-                if let Some(task) = self.tasks.get(self.selected) {
+                if let Some(task) = self.selected_task() {
                     self.pending_spawn = Some(task.clone());
                 }
             }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !self.backlog.is_empty() {
+                    self.mode = Mode::Detail;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.selected + 1 < self.tasks.len() {
+                if self.selected + 1 < self.backlog.len() {
+                    self.selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_key_detail(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.selected + 1 < self.backlog.len() {
                     self.selected += 1;
                 }
             }
@@ -172,7 +275,7 @@ impl App {
     }
 
     fn toggle_selected(&mut self) -> Result<()> {
-        if let Some(task) = self.tasks.get(self.selected) {
+        if let Some(task) = self.selected_task() {
             let id = task.id;
             self.store.toggle(id)?;
             self.refresh()?;
@@ -181,12 +284,13 @@ impl App {
     }
 
     fn start_edit(&mut self, field: Field) {
-        if let Some(task) = self.tasks.get(self.selected) {
-            self.title_editor = text_editor(&task.title);
-            self.description_editor = text_editor(&task.description);
-            self.draft_tags = task.tags.clone();
+        if let Some(task) = self.selected_task() {
+            let (title, description, tags, id) = (task.title.clone(), task.description.clone(), task.tags.clone(), task.id);
+            self.title_editor = text_editor(&title);
+            self.description_editor = text_editor(&description);
+            self.draft_tags = tags;
             self.tag_input.clear();
-            self.editing_id = Some(task.id);
+            self.editing_id = Some(id);
             self.mode = Mode::Editing(field);
         }
     }
@@ -194,7 +298,7 @@ impl App {
     fn on_key_confirm(&mut self, kind: ConfirmKind, key: KeyCode) -> Result<()> {
         match key {
             KeyCode::Char('y') | KeyCode::Enter => {
-                if let Some(task) = self.tasks.get(self.selected) {
+                if let Some(task) = self.selected_task() {
                     let id = task.id;
                     match kind {
                         ConfirmKind::Archive => self.store.archive(id)?,
@@ -227,7 +331,7 @@ impl App {
             _ => return Ok(()),
         };
         if let Some(pillar) = selection
-            && let Some(task) = self.tasks.get(self.selected)
+            && let Some(task) = self.selected_task()
         {
             let id = task.id;
             self.store.set_pillar(id, pillar)?;

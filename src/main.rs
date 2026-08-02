@@ -1,5 +1,6 @@
 mod app;
 mod agent_session;
+mod backlog;
 mod cli;
 mod config;
 mod craft;
