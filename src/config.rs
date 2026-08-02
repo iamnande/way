@@ -10,7 +10,7 @@ use crate::task::Profile;
 /// hand-editable, sane defaults when the file or a field is absent. redb is
 /// reserved for actual app data (tasks, journal entries, routines, etc.) -
 /// see issue #20's config-architecture decision.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub profiles: Vec<Profile>,
@@ -22,6 +22,17 @@ pub struct Config {
     pub checkin_cadence_days: Option<u32>,
     #[serde(default = "default_checkin_prompts")]
     pub checkin_prompts: Vec<String>,
+}
+
+// Not #[derive(Default)]: that would use Vec::default() (empty) for
+// checkin_prompts, bypassing the #[serde(default = "...")] function, which
+// only fires on deserialization (a missing field), not on Default::default()
+// itself. Implemented by hand so both paths - a fresh Config::default() and
+// parsing a config.toml missing this field - land on the same defaults.
+impl Default for Config {
+    fn default() -> Self {
+        Self { profiles: Vec::new(), active_profile: None, checkin_cadence_days: None, checkin_prompts: default_checkin_prompts() }
+    }
 }
 
 fn default_checkin_prompts() -> Vec<String> {
@@ -111,6 +122,15 @@ mod tests {
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(config.profiles[0].name, "personal");
         assert_eq!(config.active_profile.as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn default_config_has_the_three_readme_checkin_prompts() {
+        // Regression: #[serde(default = "fn")] only fires on deserialization
+        // of a missing field, not on Default::default() itself - Config::default()
+        // must not silently fall back to an empty Vec here.
+        let config = Config::default();
+        assert_eq!(config.checkin_prompts.len(), 3);
     }
 
     #[test]
