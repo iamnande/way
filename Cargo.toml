@@ -3,6 +3,16 @@ name = "way"
 version = "0.1.0"
 edition = "2024"
 
+# PROTOTYPE — wipe me. Throwaway TUI-variants prototype for wayfinder ticket #21.
+# Run with: cargo run --bin tui-prototype
+[[bin]]
+name = "tui-prototype"
+path = "src/bin/tui_prototype.rs"
+
+[[bin]]
+name = "way"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
