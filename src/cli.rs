@@ -832,12 +832,13 @@ fn run_stability(action: StabilityCommand, store: &dyn Store) -> Result<()> {
 fn run_principle(action: PrincipleCommand, store: &dyn Store) -> Result<()> {
     match action {
         PrincipleCommand::Add { text, stdin } => {
-            let text = if stdin || text.is_none() {
-                let mut blob = String::new();
-                std::io::stdin().read_to_string(&mut blob)?;
-                blob.trim().to_string()
-            } else {
-                text.unwrap()
+            let text = match text {
+                Some(text) if !stdin => text,
+                _ => {
+                    let mut blob = String::new();
+                    std::io::stdin().read_to_string(&mut blob)?;
+                    blob.trim().to_string()
+                }
             };
             let principle = store.add_principle(text)?;
             println!("{}", serde_json::to_string_pretty(&principle)?);
