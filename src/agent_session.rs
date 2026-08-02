@@ -97,8 +97,10 @@ pub fn launch_claude_for_task(store: &dyn Store, task: &Task) -> Result<()> {
 }
 
 /// The stable part of a task's tab name - used to find an already-open tab
-/// even after its label's mutable suffix (status) has gone stale.
-fn tab_prefix(key: u32) -> String {
+/// even after its label's mutable suffix (status) has gone stale. `pub`:
+/// also used by `app::App::refresh` to check a task against the live-tab
+/// list for the TUI's session-liveness indicator (WAY-8).
+pub fn tab_prefix(key: u32) -> String {
     format!("[WAY-{key}] ")
 }
 

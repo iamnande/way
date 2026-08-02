@@ -15,6 +15,11 @@ pub trait Multiplexer {
     fn find_tab(&self, prefix: &str) -> Result<Option<String>>;
     fn go_to_tab(&self, name: &str) -> Result<()>;
     fn new_tab(&self, name: &str, cwd: &Path, argv: &[String]) -> Result<()>;
+    /// Every currently-open tab name in one shell-out - for the TUI's
+    /// "does this task have a live session somewhere" indicator (WAY-8),
+    /// checked against every row at once rather than one `find_tab` call
+    /// (one `zellij` subprocess) per row per redraw.
+    fn list_open_tabs(&self) -> Result<Vec<String>>;
 }
 
 /// The single session all of way's task tabs live in, kept separate from
@@ -101,11 +106,14 @@ impl Zellij {
 
 impl Multiplexer for Zellij {
     fn find_tab(&self, prefix: &str) -> Result<Option<String>> {
+        Ok(self.list_open_tabs()?.into_iter().find(|name| name.starts_with(prefix)))
+    }
+
+    fn list_open_tabs(&self) -> Result<Vec<String>> {
         let out = std::process::Command::new("zellij")
             .args(["-s", WAY_SESSION_NAME, "action", "query-tab-names"])
             .output()?;
-        let name = String::from_utf8_lossy(&out.stdout).lines().find(|line| line.trim().starts_with(prefix)).map(|line| line.trim().to_string());
-        Ok(name)
+        Ok(String::from_utf8_lossy(&out.stdout).lines().map(|line| line.trim().to_string()).filter(|l| !l.is_empty()).collect())
     }
 
     fn go_to_tab(&self, name: &str) -> Result<()> {

@@ -134,6 +134,24 @@ fn row_meta(r: BacklogRef, app: &App) -> String {
     }
 }
 
+/// WAY-8 thread 1: a leading, at-a-glance marker - `waiting_on` takes
+/// visual priority over mere session-liveness (it's the more actionable
+/// signal, "needs you right now" vs. "a session happens to be open"), so
+/// this is one glyph slot, not two competing ones. Only meaningful for
+/// Task rows; the other six kinds have no session concept.
+fn session_indicator(r: BacklogRef, app: &App) -> Span<'static> {
+    let BacklogRef::Task(i) = r else { return Span::raw("  ") };
+    let task = &app.tasks[i];
+    if task.waiting_on.is_some() {
+        return Span::styled("● ", Style::default().fg(theme::RED));
+    }
+    match app.session_status(task) {
+        crate::app::SessionStatus::Live => Span::styled("● ", Style::default().fg(theme::AQUA)),
+        crate::app::SessionStatus::Idle => Span::styled("○ ", Style::default().fg(theme::DIM)),
+        crate::app::SessionStatus::None => Span::raw("  "),
+    }
+}
+
 fn row_pillar_chip(r: BacklogRef, app: &App) -> Option<(String, Color)> {
     match r {
         BacklogRef::Task(i) => {
@@ -180,8 +198,10 @@ fn draw_backlog(frame: &mut Frame, app: &App, area: Rect) {
             let title = row_title(r, app);
             let meta = row_meta(r, app);
 
-            let mut spans = vec![Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color))];
-            let mut prefix_len = 3;
+            let mut spans = vec![session_indicator(r, app)];
+            let mut prefix_len = 2;
+            spans.push(Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)));
+            prefix_len += 3;
 
             if let Some((label, color)) = row_pillar_chip(r, app) {
                 let chip = format!("[{label}] ");
@@ -201,7 +221,13 @@ fn draw_backlog(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items).highlight_symbol("▎").highlight_style(Style::default().fg(theme::FG).add_modifier(Modifier::BOLD));
+    // WAY-5's flagged quirk, fixed here: no .fg() in highlight_style - ratatui
+    // patches a Line's own per-span styles with this on the selected row, so
+    // setting an explicit fg used to flatten every row's own color (the red
+    // waiting-dot, pillar/kind chips, glyph colors) to theme::FG whenever it
+    // happened to be selected. bg + bold is enough to mark the row without
+    // erasing what it's actually telling you at a glance.
+    let list = List::new(items).highlight_symbol("▎").highlight_style(Style::default().bg(theme::SELECT_BG).add_modifier(Modifier::BOLD));
 
     let mut state = ListState::default();
     if !app.backlog.is_empty() {
@@ -435,6 +461,16 @@ fn task_detail_lines(app: &App, task: &crate::task::Task) -> Vec<Line<'static>> 
             Span::styled(format!("{reason} · {since}"), Style::default().fg(theme::RED)),
         ]));
     }
+
+    let (session_label, session_color) = match app.session_status(task) {
+        crate::app::SessionStatus::Live => ("open now, somewhere".to_string(), theme::AQUA),
+        crate::app::SessionStatus::Idle => ("not currently open".to_string(), theme::DIM),
+        crate::app::SessionStatus::None => ("never started".to_string(), theme::DIM),
+    };
+    text.push(Line::from(vec![
+        Span::styled(format!("{:<8}", "AGENT"), Style::default().fg(theme::DIM)),
+        Span::styled(session_label, Style::default().fg(session_color)),
+    ]));
 
     text.push(Line::from(""));
     text.extend(multiline(description, Style::default().fg(theme::FG)));

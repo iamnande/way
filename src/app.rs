@@ -2,9 +2,11 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 
+use crate::agent_session::tab_prefix;
 use crate::backlog::BacklogRef;
 use crate::craft::Craft;
 use crate::journal::JournalEntry;
+use crate::multiplexer::{Multiplexer, Zellij};
 use crate::person::Person;
 use crate::principle::Principle;
 use crate::routine::Routine;
@@ -43,6 +45,18 @@ impl Field {
     }
 }
 
+/// WAY-8 thread 1: whether a claude session exists for a task "somewhere."
+#[derive(Clone, Copy, PartialEq)]
+pub enum SessionStatus {
+    /// A live zellij tab for this task is open right now.
+    Live,
+    /// `claude_session_id` is set but no live tab currently matches it -
+    /// previously active, not running now.
+    Idle,
+    /// Never started.
+    None,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum View {
     Active,
@@ -76,6 +90,13 @@ pub struct App {
     /// The unified, flat, selectable sequence rendered in the list pane -
     /// active-view only (archived stays task-only, see `refresh`).
     pub backlog: Vec<BacklogRef>,
+    /// Every currently-open tab name in way's zellij session, refreshed
+    /// alongside everything else in `refresh()` (one shell-out, not one per
+    /// row/frame) - WAY-8's "is there a live session somewhere" indicator.
+    /// Empty (not an error) whenever zellij isn't installed or the session
+    /// doesn't exist yet - liveness is just unknown/false in that case, not
+    /// something worth surfacing as a TUI-blocking error.
+    pub live_tabs: Vec<String>,
     pub selected: usize,
     pub mode: Mode,
     pub view: View,
@@ -103,6 +124,7 @@ impl App {
             stability: Vec::new(),
             principles: Vec::new(),
             backlog: Vec::new(),
+            live_tabs: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
             view: View::Active,
@@ -125,6 +147,11 @@ impl App {
             View::Active => self.store.list()?,
             View::Archived => self.store.list_archived()?,
         };
+
+        // Best-effort: no zellij, no "way" session yet, or any other query
+        // failure all just mean "liveness unknown" - never worth failing an
+        // otherwise-successful refresh over.
+        self.live_tabs = if Zellij::is_installed() { Zellij.list_open_tabs().unwrap_or_default() } else { Vec::new() };
 
         self.backlog.clear();
         for i in 0..self.tasks.len() {
@@ -184,6 +211,21 @@ impl App {
         match self.backlog.get(self.selected) {
             Some(BacklogRef::Task(i)) => self.tasks.get(*i),
             _ => None,
+        }
+    }
+
+    /// WAY-8, thread 1: is a claude session "somewhere" for this task - a
+    /// live zellij tab right now, a previously-active one (session id set,
+    /// no live tab), or neither. Purely derived from already-refreshed
+    /// state - no I/O here, `refresh` already did the one shell-out.
+    pub fn session_status(&self, task: &Task) -> SessionStatus {
+        let prefix = tab_prefix(task.key);
+        if self.live_tabs.iter().any(|name| name.starts_with(&prefix)) {
+            SessionStatus::Live
+        } else if task.claude_session_id.is_some() {
+            SessionStatus::Idle
+        } else {
+            SessionStatus::None
         }
     }
 
