@@ -31,28 +31,122 @@ use ratatui::{Frame, Terminal};
 mod theme;
 
 #[derive(Clone)]
+enum Detail {
+    Text(&'static str),
+    Routine {
+        total: &'static str,
+        // name, sets x reps, intensity 0.0-1.0, friction 0.0-1.0, duration
+        exercises: &'static [(&'static str, &'static str, f32, f32, &'static str)],
+    },
+    Area {
+        status: &'static str,
+        space: Option<&'static str>,
+        standing: &'static str,
+        trajectory: &'static str,
+    },
+    Person {
+        relationship: &'static str,
+        hobbies: &'static [&'static str],
+        dreams: &'static [&'static str],
+        attention: Option<&'static str>,
+    },
+    Quote(&'static str),
+}
+
+impl Detail {
+    fn fallback_text(&self) -> String {
+        match self {
+            Detail::Text(t) | Detail::Quote(t) => t.to_string(),
+            Detail::Routine { total, exercises } => {
+                let mut s = format!("{total}\n\n");
+                for (name, sr, intensity, friction, dur) in *exercises {
+                    s.push_str(&format!("{name}: {sr}, intensity {intensity:.1}, friction {friction:.1}, {dur}\n"));
+                }
+                s
+            }
+            Detail::Area { standing, trajectory, .. } => format!("Standing: {standing}\nTrajectory: {trajectory}"),
+            Detail::Person { hobbies, dreams, .. } => format!("Hobbies: {}\nDreams: {}", hobbies.join(", "), dreams.join(", ")),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Item {
     kind: &'static str,
     title: &'static str,
     pillar: &'static str,
     meta: &'static str,
-    detail: &'static str,
+    detail: Detail,
 }
 
 fn fixture() -> Vec<Item> {
     vec![
-        Item { kind: "obstacle", title: "spike: quality autonomous workflows", pillar: "craft", meta: "in-flight", detail: "Working WAY-5's alignment checkpoints. Currently at 'planning' phase." },
-        Item { kind: "journal", title: "morning pages", pillar: "mind", meta: "today", detail: "Woke up thinking about the HOA board seat. Feels like a real chance to..." },
-        Item { kind: "journal", title: "check-in: goals/progress", pillar: "mind", meta: "3 days ago", detail: "Q: What has your attention lately?\nA: Way's vision work, mostly." },
-        Item { kind: "routine", title: "push day", pillar: "body", meta: "4 exercises", detail: "bench 4x8, ohp 3x10, dips 3x12, triceps 3x15 - ~42min, intensity 0.7" },
-        Item { kind: "completion", title: "push day - logged", pillar: "body", meta: "yesterday", detail: "Felt strong on bench, dips were rough." },
-        Item { kind: "person", title: "youngest", pillar: "relationships", meta: "child", detail: "Loves skating with dad. Currently into: gatorade glacier freeze." },
-        Item { kind: "craft", title: "skateboarding", pillar: "craft", meta: "active", detail: "Standing: landed 50-50 stalls, sad 50-50 grinds on small transitions. Trajectory: build consistency, twice a week with the kids." },
-        Item { kind: "craft", title: "woodworking", pillar: "craft", meta: "dormant", detail: "Standing: more tools than experience. Trajectory: long-horizon hobby to hone." },
-        Item { kind: "stability", title: "safety net", pillar: "stability", meta: "active", detail: "Standing: building toward 6mo expenses. Trajectory: increase automatic transfer next quarter." },
-        Item { kind: "stability", title: "retirement", pillar: "stability", meta: "needs attention", detail: "Standing: 401k contributions steady. IRR reenlistment decision pending, would change trajectory." },
-        Item { kind: "principle", title: "meditations #1", pillar: "purpose", meta: "", detail: "You are not what you have mastered. You are what you are willing to risk becoming." },
-        Item { kind: "obstacle", title: "fix: read/write lock handling", pillar: "craft", meta: "open", detail: "Concurrent opens on the same redb path shouldn't lock each other out." },
+        Item { kind: "obstacle", title: "spike: quality autonomous workflows", pillar: "craft", meta: "in-flight", detail: Detail::Text("Working WAY-5's alignment checkpoints. Currently at 'planning' phase.") },
+        Item { kind: "journal", title: "morning pages", pillar: "mind", meta: "today", detail: Detail::Text("Woke up thinking about the HOA board seat. Feels like a real chance to invest in the community differently than I expected to at this age.") },
+        Item { kind: "journal", title: "check-in: goals/progress", pillar: "mind", meta: "3 days ago", detail: Detail::Text("Q: What has your attention lately?\nA: Way's vision work, mostly.\n\nQ: How's progress against your goals?\nA: Steady. Six pillars specced.") },
+        Item {
+            kind: "routine",
+            title: "push day",
+            pillar: "body",
+            meta: "4 exercises",
+            detail: Detail::Routine {
+                total: "~42min total · avg intensity 0.7 · avg friction 0.6",
+                exercises: &[
+                    ("bench", "4x8", 0.8, 0.6, "12min"),
+                    ("ohp", "3x10", 0.7, 0.5, "9min"),
+                    ("dips", "3x12", 0.6, 0.7, "8min"),
+                    ("triceps", "3x15", 0.5, 0.4, "7min"),
+                ],
+            },
+        },
+        Item { kind: "completion", title: "push day - logged", pillar: "body", meta: "yesterday", detail: Detail::Text("Felt strong on bench, dips were rough.") },
+        Item {
+            kind: "person",
+            title: "youngest",
+            pillar: "relationships",
+            meta: "child",
+            detail: Detail::Person {
+                relationship: "child",
+                hobbies: &["skateboarding", "drawing"],
+                dreams: &["own a skate shop someday"],
+                attention: Some("gatorade glacier freeze, always"),
+            },
+        },
+        Item {
+            kind: "craft",
+            title: "skateboarding",
+            pillar: "craft",
+            meta: "active",
+            detail: Detail::Area {
+                status: "active",
+                space: Some("street skating, ledges/small transitions"),
+                standing: "landed 50-50 stalls; sad 50-50 grinds on small transitions",
+                trajectory: "build consistency, twice a week with the kids",
+            },
+        },
+        Item {
+            kind: "craft",
+            title: "woodworking",
+            pillar: "craft",
+            meta: "dormant",
+            detail: Detail::Area { status: "dormant", space: Some("furniture, hand tools"), standing: "more tools than experience", trajectory: "long-horizon hobby to hone" },
+        },
+        Item {
+            kind: "stability",
+            title: "safety net",
+            pillar: "stability",
+            meta: "active",
+            detail: Detail::Area { status: "active", space: None, standing: "building toward 6mo expenses", trajectory: "increase automatic transfer next quarter" },
+        },
+        Item {
+            kind: "stability",
+            title: "retirement",
+            pillar: "stability",
+            meta: "needs attention",
+            detail: Detail::Area { status: "dormant", space: None, standing: "401k contributions steady", trajectory: "IRR reenlistment decision pending, would change this" },
+        },
+        Item { kind: "principle", title: "meditations #1", pillar: "purpose", meta: "", detail: Detail::Quote("You are not what you have mastered. You are what you are willing to risk becoming.") },
+        Item { kind: "obstacle", title: "fix: read/write lock handling", pillar: "craft", meta: "open", detail: Detail::Text("Concurrent opens on the same redb path shouldn't lock each other out.") },
     ]
 }
 
@@ -302,7 +396,7 @@ fn draw_variant_a(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(Line::from(Span::styled("─".repeat(detail_area.width as usize), Style::default().fg(theme::DIM)))), Rect { height: 1, ..detail_area });
         if let Some(item) = filtered.get(app.selected) {
             let inner = Rect { y: detail_area.y + 1, height: detail_area.height.saturating_sub(1), ..detail_area };
-            frame.render_widget(Paragraph::new(item.detail).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+            frame.render_widget(Paragraph::new(item.detail.fallback_text()).wrap(ratatui::widgets::Wrap { trim: false }), inner);
         }
     }
 
@@ -402,7 +496,7 @@ fn draw_variant_b(frame: &mut Frame, app: &App, area: Rect) {
             let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(pillar_color(item.pillar))).title(format!(" {} ", item.title));
             let inner = block.inner(popup);
             frame.render_widget(block, popup);
-            frame.render_widget(Paragraph::new(item.detail).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+            frame.render_widget(Paragraph::new(item.detail.fallback_text()).wrap(ratatui::widgets::Wrap { trim: false }), inner);
         }
     }
 
@@ -485,8 +579,9 @@ fn draw_variant_c(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(""),
         ];
-        for l in item.detail.lines() {
-            lines.push(Line::from(Span::styled(l, Style::default().fg(theme::FG))));
+        let detail_text = item.detail.fallback_text();
+        for l in detail_text.lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme::FG))));
         }
         let padded = Rect { x: area.x + 2, width: area.width.saturating_sub(4), ..rows[1] };
         frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), padded);
@@ -504,6 +599,102 @@ fn draw_variant_c(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Clear, popup);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::AQUA)).title(" go to ");
         frame.render_widget(block, popup);
+    }
+}
+
+// ---------- bespoke per-kind detail rendering (round 3: "the blank/bare
+// rectangle is lame" - each entity kind gets its own layout, not one
+// generic wrapped-text box) ----------
+
+fn bar(value: f32, width: usize) -> String {
+    let filled = ((value.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn label(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD))
+}
+
+fn detail_lines(item: &Item) -> Vec<Line<'static>> {
+    match &item.detail {
+        Detail::Text(t) => t.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::FG)))).collect(),
+
+        Detail::Quote(q) => {
+            let mut lines = vec![Line::from(Span::styled("  “", Style::default().fg(pillar_color(item.pillar)).add_modifier(Modifier::BOLD)))];
+            for l in q.lines() {
+                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::FG).add_modifier(Modifier::ITALIC))));
+            }
+            lines.push(Line::from(Span::styled("  ”", Style::default().fg(pillar_color(item.pillar)).add_modifier(Modifier::BOLD))));
+            lines
+        }
+
+        Detail::Routine { total, exercises } => {
+            let mut lines = vec![Line::from(Span::styled(*total, Style::default().fg(theme::DIM))), Line::from("")];
+            for (name, sr, intensity, friction, dur) in *exercises {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{name:<10}", name = name), Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{sr:<7}", sr = sr), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {} ", dur), Style::default().fg(theme::DIM)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    label("int "),
+                    Span::styled(bar(*intensity, 12), Style::default().fg(theme::ORANGE)),
+                    Span::raw("  "),
+                    label("fric "),
+                    Span::styled(bar(*friction, 12), Style::default().fg(theme::AQUA)),
+                ]));
+                lines.push(Line::from(""));
+            }
+            lines
+        }
+
+        Detail::Area { status, space, standing, trajectory } => {
+            let status_color = match *status {
+                "active" => theme::GREEN,
+                "dormant" => theme::ORANGE,
+                _ => theme::DIM,
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {} ", status.to_uppercase()), Style::default().bg(status_color).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+            ];
+            if let Some(space) = space {
+                lines.push(Line::from(label("SPACE")));
+                lines.push(Line::from(Span::styled(*space, Style::default().fg(theme::FG))));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(label("STANDING")));
+            lines.push(Line::from(Span::styled(*standing, Style::default().fg(theme::FG))));
+            lines.push(Line::from(""));
+            lines.push(Line::from(label("TRAJECTORY")));
+            lines.push(Line::from(Span::styled(*trajectory, Style::default().fg(theme::FG))));
+            lines
+        }
+
+        Detail::Person { relationship, hobbies, dreams, attention } => {
+            let mut lines = vec![
+                Line::from(vec![Span::styled(format!(" {} ", relationship), Style::default().bg(pillar_color(item.pillar)).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+            ];
+            if !hobbies.is_empty() {
+                lines.push(Line::from(label("HOBBIES")));
+                let chips: Vec<Span> = hobbies.iter().map(|h| Span::styled(format!("[{h}] "), Style::default().fg(theme::AQUA))).collect();
+                lines.push(Line::from(chips));
+                lines.push(Line::from(""));
+            }
+            if !dreams.is_empty() {
+                lines.push(Line::from(label("DREAMS")));
+                let chips: Vec<Span> = dreams.iter().map(|d| Span::styled(format!("[{d}] "), Style::default().fg(theme::GREEN))).collect();
+                lines.push(Line::from(chips));
+                lines.push(Line::from(""));
+            }
+            if let Some(attention) = attention {
+                lines.push(Line::from(label("ATTENTION")));
+                lines.push(Line::from(Span::styled(*attention, Style::default().fg(theme::RED))));
+            }
+            lines
+        }
     }
 }
 
@@ -589,10 +780,16 @@ fn draw_variant_d(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, item)| {
             let selected = i == app.selected;
-            let style = if selected { Style::default().bg(theme::SELECT_BG).fg(theme::FG) } else { Style::default().fg(theme::FG) };
+            let marker = if selected { Span::styled("▎", Style::default().fg(pillar_color(item.pillar))) } else { Span::raw(" ") };
+            let title_style = if selected {
+                Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::FG)
+            };
             Line::from(vec![
-                Span::styled(format!("  {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar))),
-                Span::styled(format!("{:<40}", item.title), style),
+                marker,
+                Span::styled(format!(" {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar))),
+                Span::styled(format!("{:<40}", item.title), title_style),
                 Span::styled(format!("  {}", item.meta), Style::default().fg(theme::DIM)),
             ])
         })
@@ -601,12 +798,21 @@ fn draw_variant_d(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.d_detail_open {
         if let Some(item) = filtered.get(app.selected) {
-            let popup = centered_rect(area, 72, 65);
+            let popup = centered_rect(area, 76, 70);
             frame.render_widget(Clear, popup);
-            let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(pillar_color(item.pillar))).title(format!(" {} ", item.title));
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(pillar_color(item.pillar)))
+                .title(Line::from(vec![
+                    Span::styled(format!(" {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar)).add_modifier(Modifier::BOLD)),
+                    Span::styled(item.title, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                ]));
             let inner = block.inner(popup);
             frame.render_widget(block, popup);
-            frame.render_widget(Paragraph::new(item.detail).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+            let padded = Rect { x: inner.x + 1, y: inner.y, width: inner.width.saturating_sub(2), height: inner.height };
+            frame.render_widget(Paragraph::new(detail_lines(item)).wrap(ratatui::widgets::Wrap { trim: false }), padded);
         }
     }
 
