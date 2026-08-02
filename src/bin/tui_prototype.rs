@@ -178,6 +178,11 @@ fn pillar_color(pillar: &str) -> ratatui::style::Color {
 
 const PILLARS: [&str; 7] = ["all", "mind", "body", "relationships", "craft", "stability", "purpose"];
 
+enum ERow<'a> {
+    Group { pillar_idx: usize, pillar: &'static str, count: usize },
+    Item(&'a Item),
+}
+
 struct App {
     variant: usize,
     items: Vec<Item>,
@@ -199,12 +204,18 @@ struct App {
     d_command_input: String,
     d_goto_pending: bool,
     d_detail_open: bool,
+    // variant E - unified, grouped backlog (jira-backlog structure/placement)
+    e_selected: usize,
+    e_collapsed: [bool; 7], // indexed by PILLARS index, 0 unused
+    e_filter_mode: bool,
+    e_filter: String,
+    e_detail_open: bool,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            variant: 3, // open on D — the synthesized, currently-best candidate
+            variant: 4, // open on E — jira-backlog structure, the current best candidate
             items: fixture(),
             selected: 0,
             pillar_filter: 1, // start on "mind", not "all" - a real tab, not the catch-all
@@ -220,6 +231,11 @@ impl App {
             d_command_input: String::new(),
             d_goto_pending: false,
             d_detail_open: false,
+            e_selected: 0,
+            e_collapsed: [false; 7],
+            e_filter_mode: false,
+            e_filter: String::new(),
+            e_detail_open: false,
         }
     }
 
@@ -230,6 +246,33 @@ impl App {
             let p = PILLARS[self.pillar_filter];
             self.items.iter().filter(|i| i.pillar == p).collect()
         }
+    }
+
+    // Flattened rows for variant E's unified backlog: a group header per
+    // pillar (that has at least one matching item) followed by its items,
+    // unless that group is collapsed - mirrors a Jira backlog's collapsible
+    // epic/sprint grouping within one continuous scrollable list.
+    fn e_rows(&self) -> Vec<ERow<'_>> {
+        let filter = self.e_filter.to_lowercase();
+        let mut rows = Vec::new();
+        for (i, pillar) in PILLARS.iter().enumerate().skip(1) {
+            let items: Vec<&Item> = self
+                .items
+                .iter()
+                .filter(|it| it.pillar == *pillar)
+                .filter(|it| filter.is_empty() || it.title.to_lowercase().contains(&filter) || it.kind.contains(&filter as &str))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            rows.push(ERow::Group { pillar_idx: i, pillar, count: items.len() });
+            if !self.e_collapsed[i] {
+                for it in items {
+                    rows.push(ERow::Item(it));
+                }
+            }
+        }
+        rows
     }
 
     fn groups_b(&self) -> Vec<&'static str> {
@@ -268,19 +311,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             // text input (command bar / quick-switcher), where Tab still
             // cycles (no text field wants literal tabs here) but plain 'q'
             // should type instead of quit.
-            let typing = app.command_mode || app.switcher_open || app.d_command_mode;
+            let typing = app.command_mode || app.switcher_open || app.d_command_mode || app.e_filter_mode;
 
             match key.code {
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.variant = (app.variant + 3) % 4;
+                    app.variant = (app.variant + 4) % 5;
                     continue;
                 }
                 KeyCode::Tab => {
-                    app.variant = (app.variant + 1) % 4;
+                    app.variant = (app.variant + 1) % 5;
                     continue;
                 }
                 KeyCode::BackTab => {
-                    app.variant = (app.variant + 3) % 4;
+                    app.variant = (app.variant + 4) % 5;
                     continue;
                 }
                 _ => {}
@@ -295,6 +338,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 1 => handle_variant_b(app, key.code),
                 2 => handle_variant_c(app, key.code),
                 3 => handle_variant_d(app, key.code),
+                4 => handle_variant_e(app, key.code),
                 _ => unreachable!(),
             }
         }
@@ -846,6 +890,156 @@ fn draw_variant_d(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+// ---------- Variant E: unified, grouped backlog (jira-backlog structure) ----------
+//
+// Nick: "it lacks the unified view i get from a linear/jira backlog...
+// not the UI per-se, the UX and structure/placement." D's hard per-pillar
+// tabs meant you only ever see one pillar at a time. E drops that: one
+// continuous, scrollable list, grouped by pillar (collapsible, like a
+// Jira backlog's epic/sprint grouping), narrowed by an in-place filter
+// instead of switching screens. Detail view reuses D's bespoke per-kind
+// rendering unchanged - that part wasn't the complaint.
+
+fn handle_variant_e(app: &mut App, key: KeyCode) {
+    if app.e_filter_mode {
+        match key {
+            KeyCode::Esc => {
+                app.e_filter_mode = false;
+                app.e_filter.clear();
+                app.e_selected = 0;
+            }
+            KeyCode::Enter => {
+                app.e_filter_mode = false;
+                app.e_selected = 0;
+            }
+            KeyCode::Backspace => {
+                app.e_filter.pop();
+            }
+            KeyCode::Char(c) => app.e_filter.push(c),
+            _ => {}
+        }
+        return;
+    }
+    if app.e_detail_open {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => app.e_detail_open = false,
+            _ => {}
+        }
+        return;
+    }
+
+    let rows = app.e_rows();
+    let len = rows.len().max(1);
+    match key {
+        KeyCode::Char('j') | KeyCode::Down => app.e_selected = (app.e_selected + 1) % len,
+        KeyCode::Char('k') | KeyCode::Up => app.e_selected = (app.e_selected + len - 1) % len,
+        KeyCode::Char('/') => app.e_filter_mode = true,
+        KeyCode::Esc if !app.e_filter.is_empty() => {
+            app.e_filter.clear();
+            app.e_selected = 0;
+        }
+        KeyCode::Enter => {
+            if let Some(row) = rows.get(app.e_selected) {
+                match row {
+                    ERow::Group { pillar_idx, .. } => app.e_collapsed[*pillar_idx] = !app.e_collapsed[*pillar_idx],
+                    ERow::Item(_) => app.e_detail_open = true,
+                }
+            }
+        }
+        KeyCode::Char(n @ '1'..='6') => {
+            let target_idx = (n as u8 - b'0') as usize;
+            if let Some(pos) = rows.iter().position(|r| matches!(r, ERow::Group { pillar_idx, .. } if *pillar_idx == target_idx)) {
+                app.e_selected = pos;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn draw_variant_e(frame: &mut Frame, app: &App, area: Rect) {
+    let rows_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    let total_items = app.items.len();
+    let total_pillars = PILLARS[1..].iter().filter(|p| app.items.iter().any(|it| it.pillar == **p)).count();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("way › backlog   {total_items} items across {total_pillars} pillars"), Style::default().fg(theme::DIM)))),
+        rows_layout[0],
+    );
+
+    let e_rows = app.e_rows();
+    let lines: Vec<Line> = e_rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let selected = i == app.e_selected;
+            match row {
+                ERow::Group { pillar_idx, pillar, count } => {
+                    let arrow = if app.e_collapsed[*pillar_idx] { "▸" } else { "▾" };
+                    let marker = if selected { Span::styled("▎", Style::default().fg(pillar_color(pillar))) } else { Span::raw(" ") };
+                    Line::from(vec![
+                        marker,
+                        Span::styled(format!(" {arrow} "), Style::default().fg(pillar_color(pillar))),
+                        Span::styled(pillar.to_uppercase(), Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("  ({count})"), Style::default().fg(theme::DIM)),
+                    ])
+                }
+                ERow::Item(item) => {
+                    let marker = if selected { Span::styled("▎", Style::default().fg(pillar_color(item.pillar))) } else { Span::raw(" ") };
+                    let title_style = if selected { Style::default().fg(theme::FG).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::FG) };
+                    Line::from(vec![
+                        marker,
+                        Span::raw("    "),
+                        Span::styled(format!("{} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar))),
+                        Span::styled(format!("{:<38}", item.title), title_style),
+                        Span::styled(format!("  {}", item.meta), Style::default().fg(theme::DIM)),
+                    ])
+                }
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows_layout[1]);
+
+    if app.e_detail_open {
+        if let Some(ERow::Item(item)) = e_rows.get(app.e_selected) {
+            let popup = centered_rect(area, 76, 70);
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(pillar_color(item.pillar)))
+                .title(Line::from(vec![
+                    Span::styled(format!(" {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar)).add_modifier(Modifier::BOLD)),
+                    Span::styled(item.title, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                ]));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            let padded = Rect { x: inner.x + 1, y: inner.y, width: inner.width.saturating_sub(2), height: inner.height };
+            frame.render_widget(Paragraph::new(detail_lines(item)).wrap(ratatui::widgets::Wrap { trim: false }), padded);
+        }
+    }
+
+    if app.e_filter_mode {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" FILTER ", Style::default().bg(theme::AQUA).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" /{}", app.e_filter), Style::default().fg(theme::AQUA)),
+            ])),
+            rows_layout[2],
+        );
+    } else {
+        let pos = format!("{}/{}", if e_rows.is_empty() { 0 } else { app.e_selected + 1 }, e_rows.len());
+        let mode_badge = Span::styled(" NORMAL ", Style::default().bg(theme::GREEN).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD));
+        let filter_note = if app.e_filter.is_empty() { String::new() } else { format!("  filter:{}", app.e_filter) };
+        let breadcrumb = Span::styled(format!("  way › backlog{filter_note}   "), Style::default().fg(theme::FG));
+        let hint = Span::styled("j/k move  enter open/collapse  / filter  1-6 jump  Tab variant  q quit   ", Style::default().fg(theme::DIM));
+        frame.render_widget(Paragraph::new(Line::from(vec![mode_badge, breadcrumb, hint, Span::styled(pos, Style::default().fg(theme::DIM))])), rows_layout[2]);
+    }
+}
+
 // ---------- shared frame ----------
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -857,10 +1051,17 @@ fn draw(frame: &mut Frame, app: &App) {
         1 => draw_variant_b(frame, app, rows[0]),
         2 => draw_variant_c(frame, app, rows[0]),
         3 => draw_variant_d(frame, app, rows[0]),
+        4 => draw_variant_e(frame, app, rows[0]),
         _ => unreachable!(),
     }
 
-    let names = ["A — command palette", "B — sidebar + slide-over", "C — focused pager + quick-switch", "D — Zellij tabs + Helix status/command"];
+    let names = [
+        "A — command palette",
+        "B — sidebar + slide-over",
+        "C — focused pager + quick-switch",
+        "D — Zellij tabs + Helix status/command",
+        "E — unified backlog (jira structure)",
+    ];
     let indicator = Line::from(vec![
         Span::styled(" PROTOTYPE ", Style::default().bg(theme::RED).fg(theme::FG).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}  ", names[app.variant]), Style::default().bg(theme::SELECT_BG).fg(theme::FG)),
