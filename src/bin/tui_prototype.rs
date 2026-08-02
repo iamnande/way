@@ -4,8 +4,15 @@
 // single task list to 7 entity types, with a cleaner/friendlier feel?"
 //
 // Run: cargo run --bin tui-prototype
-// Tab / Shift+Tab cycles the three variants. Fixture data only, no store,
-// no persistence. Not tested, not polished, not meant to be kept.
+// Tab / Shift+Tab cycles variants. Opens on D by default — nick's reaction
+// to round 1 (A/B/C): "don't like any of them, maybe some aspects of the
+// first... I really like helix and zellij, default zellij is kinda nice."
+// D synthesizes: Zellij's default numbered tab bar, Helix's minimal
+// mode-badge status line + `:` command mode + `g`-prefix goto chords, and
+// the clean/low-chrome list feel of yazi / taskwarrior-tui (both on the
+// ratatui showcase). A/B/C kept for comparison, not because they won.
+// Fixture data only, no store, no persistence. Not tested, not polished,
+// not meant to be kept.
 
 use std::io;
 
@@ -93,15 +100,20 @@ struct App {
     // variant C
     switcher_open: bool,
     switcher_input: String,
+    // variant D
+    d_command_mode: bool,
+    d_command_input: String,
+    d_goto_pending: bool,
+    d_detail_open: bool,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            variant: 0,
+            variant: 3, // open on D — the synthesized, currently-best candidate
             items: fixture(),
             selected: 0,
-            pillar_filter: 0,
+            pillar_filter: 1, // start on "mind", not "all" - a real tab, not the catch-all
             command_mode: false,
             command_input: String::new(),
             split_detail: false,
@@ -110,6 +122,10 @@ impl App {
             sidebar_group: 0,
             switcher_open: false,
             switcher_input: String::new(),
+            d_command_mode: false,
+            d_command_input: String::new(),
+            d_goto_pending: false,
+            d_detail_open: false,
         }
     }
 
@@ -158,19 +174,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             // text input (command bar / quick-switcher), where Tab still
             // cycles (no text field wants literal tabs here) but plain 'q'
             // should type instead of quit.
-            let typing = app.command_mode || app.switcher_open;
+            let typing = app.command_mode || app.switcher_open || app.d_command_mode;
 
             match key.code {
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.variant = (app.variant + 2) % 3;
+                    app.variant = (app.variant + 3) % 4;
                     continue;
                 }
                 KeyCode::Tab => {
-                    app.variant = (app.variant + 1) % 3;
+                    app.variant = (app.variant + 1) % 4;
                     continue;
                 }
                 KeyCode::BackTab => {
-                    app.variant = (app.variant + 2) % 3;
+                    app.variant = (app.variant + 3) % 4;
                     continue;
                 }
                 _ => {}
@@ -184,6 +200,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 0 => handle_variant_a(app, key.code),
                 1 => handle_variant_b(app, key.code),
                 2 => handle_variant_c(app, key.code),
+                3 => handle_variant_d(app, key.code),
                 _ => unreachable!(),
             }
         }
@@ -490,6 +507,139 @@ fn draw_variant_c(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+// ---------- Variant D: Zellij tab bar + Helix status line/command mode ----------
+
+fn handle_variant_d(app: &mut App, key: KeyCode) {
+    if app.d_command_mode {
+        match key {
+            KeyCode::Esc => {
+                app.d_command_mode = false;
+                app.d_command_input.clear();
+            }
+            KeyCode::Enter => {
+                app.d_command_mode = false;
+                app.d_command_input.clear();
+            }
+            KeyCode::Backspace => {
+                app.d_command_input.pop();
+            }
+            KeyCode::Char(c) => app.d_command_input.push(c),
+            _ => {}
+        }
+        return;
+    }
+    if app.d_goto_pending {
+        // helix-style chord: 'g' then a follow-up key completes the motion.
+        // here: g + pillar's first letter jumps straight to that tab.
+        app.d_goto_pending = false;
+        if let KeyCode::Char(c) = key {
+            if let Some(idx) = PILLARS.iter().position(|p| p.starts_with(c)) {
+                app.pillar_filter = idx.max(1);
+                app.selected = 0;
+            }
+        }
+        return;
+    }
+    if app.d_detail_open {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => app.d_detail_open = false,
+            _ => {}
+        }
+        return;
+    }
+    let len = app.filtered_a().len().max(1);
+    match key {
+        KeyCode::Char('j') | KeyCode::Down => app.selected = (app.selected + 1) % len,
+        KeyCode::Char('k') | KeyCode::Up => app.selected = (app.selected + len - 1) % len,
+        KeyCode::Char(n @ '1'..='6') => {
+            let idx = (n as u8 - b'0') as usize;
+            if idx < PILLARS.len() {
+                app.pillar_filter = idx;
+                app.selected = 0;
+            }
+        }
+        KeyCode::Char('g') => app.d_goto_pending = true,
+        KeyCode::Enter => app.d_detail_open = true,
+        KeyCode::Char(':') => app.d_command_mode = true,
+        _ => {}
+    }
+}
+
+fn draw_variant_d(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    // Zellij-style numbered tab bar: active tab is a solid colored block,
+    // inactive tabs are dim plain text - no borders anywhere.
+    let mut tabs = Vec::new();
+    for (i, p) in PILLARS.iter().enumerate().skip(1) {
+        if i == app.pillar_filter {
+            tabs.push(Span::styled(format!(" {i} {p} "), Style::default().bg(pillar_color(p)).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)));
+        } else {
+            tabs.push(Span::styled(format!(" {i} {p} "), Style::default().fg(theme::DIM)));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
+
+    let filtered = app.filtered_a();
+    let lines: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let selected = i == app.selected;
+            let style = if selected { Style::default().bg(theme::SELECT_BG).fg(theme::FG) } else { Style::default().fg(theme::FG) };
+            Line::from(vec![
+                Span::styled(format!("  {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar))),
+                Span::styled(format!("{:<40}", item.title), style),
+                Span::styled(format!("  {}", item.meta), Style::default().fg(theme::DIM)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows[1]);
+
+    if app.d_detail_open {
+        if let Some(item) = filtered.get(app.selected) {
+            let popup = centered_rect(area, 72, 65);
+            frame.render_widget(Clear, popup);
+            let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(pillar_color(item.pillar))).title(format!(" {} ", item.title));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            frame.render_widget(Paragraph::new(item.detail).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+        }
+    }
+
+    // Helix-style status line: mode badge (left, colored block) + breadcrumb
+    // (middle) + position (right). Swaps to a ':' command line when active.
+    if app.d_command_mode {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" COMMAND ", Style::default().bg(theme::AQUA).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" :{}", app.d_command_input), Style::default().fg(theme::AQUA)),
+            ])),
+            rows[2],
+        );
+    } else if app.d_goto_pending {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" NORMAL ", Style::default().bg(theme::GREEN).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+                Span::styled(" g…  (m/b/r/c/s/p: jump to pillar)", Style::default().fg(theme::AQUA)),
+            ])),
+            rows[2],
+        );
+    } else {
+        let pos = if filtered.is_empty() { "0/0".to_string() } else { format!("{}/{}", app.selected + 1, filtered.len()) };
+        let mode_badge = Span::styled(" NORMAL ", Style::default().bg(theme::GREEN).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD));
+        let breadcrumb = Span::styled(format!("  way › {}   ", PILLARS[app.pillar_filter]), Style::default().fg(theme::FG));
+        let hint = Span::styled("1-6 tab  j/k move  enter open  g goto  : cmd  Tab variant  q quit   ", Style::default().fg(theme::DIM));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![mode_badge, breadcrumb, hint, Span::styled(pos, Style::default().fg(theme::DIM))])),
+            rows[2],
+        );
+    }
+}
+
 // ---------- shared frame ----------
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -500,10 +650,11 @@ fn draw(frame: &mut Frame, app: &App) {
         0 => draw_variant_a(frame, app, rows[0]),
         1 => draw_variant_b(frame, app, rows[0]),
         2 => draw_variant_c(frame, app, rows[0]),
+        3 => draw_variant_d(frame, app, rows[0]),
         _ => unreachable!(),
     }
 
-    let names = ["A — command palette", "B — sidebar + slide-over", "C — focused pager + quick-switch"];
+    let names = ["A — command palette", "B — sidebar + slide-over", "C — focused pager + quick-switch", "D — Zellij tabs + Helix status/command"];
     let indicator = Line::from(vec![
         Span::styled(" PROTOTYPE ", Style::default().bg(theme::RED).fg(theme::FG).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}  ", names[app.variant]), Style::default().bg(theme::SELECT_BG).fg(theme::FG)),
