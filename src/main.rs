@@ -1,7 +1,14 @@
 mod app;
 mod agent_session;
 mod cli;
+mod config;
+mod craft;
+mod journal;
 mod multiplexer;
+mod person;
+mod principle;
+mod routine;
+mod stability;
 mod store;
 mod task;
 mod theme;
@@ -152,7 +159,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, rx:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::store::TaskStore;
     use uuid::Uuid;
 
     /// A write from another handle (standing in for a separate `way` CLI

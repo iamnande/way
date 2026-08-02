@@ -5,29 +5,37 @@ use anyhow::{anyhow, bail, Result};
 use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 
+use crate::config::{load_config, save_config};
+use crate::craft::{Craft, CraftSession, CraftStatus};
+use crate::journal::{JournalEntry, JournalEntryKind};
+use crate::person::{Person, RelationshipKind};
+use crate::principle::Principle;
+use crate::routine::{Exercise, Routine, RoutineCompletion};
+use crate::stability::{StabilityArea, StabilityStatus};
 use crate::task::{Profile, Task};
 
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tasks");
-const PROFILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("profiles");
-const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settings");
-const ACTIVE_PROFILE_KEY_PREFIX: &str = "active_profile:";
+const JOURNAL_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("journal_entries");
+const ROUTINES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("routines");
+const COMPLETIONS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("routine_completions");
+const PEOPLE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("people");
+const CRAFTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("crafts");
+const CRAFT_SESSIONS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("craft_sessions");
+const STABILITY_AREAS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("stability_areas");
+const PRINCIPLES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("principles");
 
 fn now_unix() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
 
-/// Best-effort local username, used to stamp `Task::owner` at creation and to
-/// scope the active-profile setting below. No login/auth exists yet, so this
-/// is a convenience label, not an identity.
-fn local_owner() -> String {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".to_string())
+fn next_id_ns() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
 }
 
-/// Active profile is scoped per local-owner rather than one global setting,
-/// so the store doesn't need a schema change when a real multi-user backend
-/// replaces `local_owner()` with an authenticated identity.
-fn active_profile_key(owner: &str) -> String {
-    format!("{ACTIVE_PROFILE_KEY_PREFIX}{owner}")
+/// Best-effort local username, used to stamp `Task::owner` at creation. No
+/// login/auth exists yet, so this is a convenience label, not an identity.
+fn local_owner() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -37,7 +45,7 @@ pub struct TaskTree {
     pub descendants: Vec<Task>,
 }
 
-pub trait Store {
+pub trait TaskStore {
     fn add(&self, title: String, description: String, tags: Vec<String>) -> Result<Task>;
     fn spawn_child(&self, parent_key: u32, title: String, description: String, tags: Vec<String>) -> Result<Task>;
     fn list(&self) -> Result<Vec<Task>>;
@@ -58,15 +66,89 @@ pub trait Store {
     fn set_session_decisions(&self, id: u64, decisions: Option<String>) -> Result<()>;
     fn set_session_next(&self, id: u64, next: Option<String>) -> Result<()>;
     fn clear_session(&self, id: u64) -> Result<()>;
-    fn list_profiles(&self) -> Result<Vec<Profile>>;
-    fn active_profile(&self) -> Result<Profile>;
-    fn use_profile(&self, name: &str) -> Result<()>;
-    fn add_profile(&self, profile: Profile) -> Result<()>;
     fn set_claude_session_id(&self, id: u64, session_id: Option<String>) -> Result<()>;
     /// `Some` sets `waiting_on` + stamps `waiting_on_since` together; `None`
     /// clears both together.
     fn set_waiting(&self, id: u64, reason: Option<String>) -> Result<()>;
 }
+
+pub trait ProfileStore {
+    fn list_profiles(&self) -> Result<Vec<Profile>>;
+    fn active_profile(&self) -> Result<Profile>;
+    fn use_profile(&self, name: &str) -> Result<()>;
+    fn add_profile(&self, profile: Profile) -> Result<()>;
+}
+
+pub trait RoutineStore {
+    fn add_routine(&self, name: String) -> Result<Routine>;
+    fn list_routines(&self) -> Result<Vec<Routine>>;
+    fn list_archived_routines(&self) -> Result<Vec<Routine>>;
+    fn find_routine(&self, name: &str) -> Result<Option<Routine>>;
+    fn archive_routine(&self, name: &str) -> Result<()>;
+    fn unarchive_routine(&self, name: &str) -> Result<()>;
+    fn add_exercise(&self, routine: &str, exercise: Exercise) -> Result<()>;
+    fn remove_exercise(&self, routine: &str, exercise_name: &str) -> Result<()>;
+    fn log_completion(&self, routine: &str, completed_on: i64, note: Option<String>) -> Result<RoutineCompletion>;
+    fn completion_history(&self, routine: &str) -> Result<Vec<RoutineCompletion>>;
+}
+
+pub trait PersonStore {
+    fn add_person(&self, name: String, relationship: RelationshipKind) -> Result<Person>;
+    fn list_people(&self) -> Result<Vec<Person>>;
+    fn find_person(&self, id: u64) -> Result<Option<Person>>;
+    fn remove_person(&self, id: u64) -> Result<()>;
+    fn set_person_birthdate(&self, id: u64, birthdate: Option<i64>) -> Result<()>;
+    fn add_person_dream(&self, id: u64, dream: String) -> Result<()>;
+    fn remove_person_dream(&self, id: u64, dream: &str) -> Result<()>;
+    fn add_person_hobby(&self, id: u64, hobby: String) -> Result<()>;
+    fn remove_person_hobby(&self, id: u64, hobby: &str) -> Result<()>;
+    fn add_person_attention_area(&self, id: u64, area: String) -> Result<()>;
+    fn remove_person_attention_area(&self, id: u64, area: &str) -> Result<()>;
+    fn set_person_preference(&self, id: u64, key: String, value: String) -> Result<()>;
+    fn remove_person_preference(&self, id: u64, key: &str) -> Result<()>;
+    fn set_person_notes(&self, id: u64, notes: String) -> Result<()>;
+}
+
+pub trait CraftStore {
+    fn add_craft(&self, name: String, status: CraftStatus) -> Result<Craft>;
+    fn list_crafts(&self, status: Option<CraftStatus>) -> Result<Vec<Craft>>;
+    fn find_craft(&self, name: &str) -> Result<Option<Craft>>;
+    fn remove_craft(&self, name: &str) -> Result<()>;
+    fn set_craft_status(&self, name: &str, status: CraftStatus) -> Result<()>;
+    fn set_craft_space(&self, name: &str, space: String) -> Result<()>;
+    fn set_craft_standing(&self, name: &str, standing: String) -> Result<()>;
+    fn set_craft_trajectory(&self, name: &str, trajectory: String) -> Result<()>;
+    fn log_craft_session(&self, craft: &str, logged_on: i64, note: Option<String>) -> Result<CraftSession>;
+    fn craft_session_history(&self, craft: &str) -> Result<Vec<CraftSession>>;
+}
+
+pub trait StabilityStore {
+    fn add_stability_area(&self, name: String, status: StabilityStatus) -> Result<StabilityArea>;
+    fn list_stability_areas(&self, status: Option<StabilityStatus>) -> Result<Vec<StabilityArea>>;
+    fn find_stability_area(&self, name: &str) -> Result<Option<StabilityArea>>;
+    fn remove_stability_area(&self, name: &str) -> Result<()>;
+    fn set_stability_status(&self, name: &str, status: StabilityStatus) -> Result<()>;
+    fn set_stability_standing(&self, name: &str, standing: String) -> Result<()>;
+    fn set_stability_trajectory(&self, name: &str, trajectory: String) -> Result<()>;
+}
+
+pub trait PrincipleStore {
+    fn add_principle(&self, text: String) -> Result<Principle>;
+    fn list_principles(&self) -> Result<Vec<Principle>>;
+    fn find_principle(&self, id: u64) -> Result<Option<Principle>>;
+    fn remove_principle(&self, id: u64) -> Result<()>;
+}
+
+pub trait JournalStore {
+    fn add_journal_entry(&self, kind: JournalEntryKind, content: String) -> Result<JournalEntry>;
+    fn list_journal_entries(&self) -> Result<Vec<JournalEntry>>;
+    fn find_journal_entry(&self, id: u64) -> Result<Option<JournalEntry>>;
+    fn search_journal_entries(&self, query: &str) -> Result<Vec<JournalEntry>>;
+    fn last_checkin(&self) -> Result<Option<JournalEntry>>;
+}
+
+pub trait Store: TaskStore + ProfileStore + RoutineStore + PersonStore + CraftStore + StabilityStore + PrincipleStore + JournalStore {}
+impl<T> Store for T where T: TaskStore + ProfileStore + RoutineStore + PersonStore + CraftStore + StabilityStore + PrincipleStore + JournalStore {}
 
 /// Holds only the path, not an open `Database` — redb takes an OS file lock
 /// for as long as a `Database` handle is alive, and only one process may hold
@@ -87,13 +169,20 @@ impl RedbStore {
             let db = store.db()?;
             let write_txn = db.begin_write()?;
             write_txn.open_table(TABLE)?;
-            write_txn.open_table(PROFILES_TABLE)?;
-            write_txn.open_table(SETTINGS_TABLE)?;
+            write_txn.open_table(JOURNAL_TABLE)?;
+            write_txn.open_table(ROUTINES_TABLE)?;
+            write_txn.open_table(COMPLETIONS_TABLE)?;
+            write_txn.open_table(PEOPLE_TABLE)?;
+            write_txn.open_table(CRAFTS_TABLE)?;
+            write_txn.open_table(CRAFT_SESSIONS_TABLE)?;
+            write_txn.open_table(STABILITY_AREAS_TABLE)?;
+            write_txn.open_table(PRINCIPLES_TABLE)?;
             write_txn.commit()?;
         }
         store.backfill_keys()?;
         store.normalize_pillars()?;
-        store.bootstrap_default_profile()?;
+        // Profile bootstrap now lives in Config::ensure_bootstrapped
+        // (config.toml), triggered on first load_config() call.
         Ok(store)
     }
 
@@ -177,20 +266,6 @@ impl RedbStore {
         Ok(())
     }
 
-    /// Ensures a fresh store always has a usable active profile, so existing
-    /// pillar commands keep working immediately after upgrading with no manual
-    /// setup step.
-    fn bootstrap_default_profile(&self) -> Result<()> {
-        if !self.list_profiles()?.is_empty() {
-            return Ok(());
-        }
-        let profile = Profile::default_personal();
-        let name = profile.name.clone();
-        self.add_profile(profile)?;
-        self.use_profile(&name)?;
-        Ok(())
-    }
-
     fn put(&self, task: &Task) -> Result<()> {
         let bytes = serde_json::to_vec(task)?;
         let db = self.db()?;
@@ -226,9 +301,9 @@ impl RedbStore {
     }
 }
 
-impl Store for RedbStore {
+impl TaskStore for RedbStore {
     fn add(&self, title: String, description: String, tags: Vec<String>) -> Result<Task> {
-        let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let id = next_id_ns()?;
         let key = self.next_key()?;
         let task = Task::new(id, key, title, description, tags, local_owner());
         self.put(&task)?;
@@ -240,7 +315,7 @@ impl Store for RedbStore {
         if !all.iter().any(|t| t.key == parent_key) {
             bail!("no task with key WAY-{parent_key}");
         }
-        let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let id = next_id_ns()?;
         let key = self.next_key()?;
         let mut task = Task::new(id, key, title, description, tags, local_owner());
         task.parent_key = Some(parent_key);
@@ -441,73 +516,6 @@ impl Store for RedbStore {
         Ok(())
     }
 
-    fn list_profiles(&self) -> Result<Vec<Profile>> {
-        let db = self.db()?;
-        let read_txn = db.begin_read()?;
-        let table = read_txn.open_table(PROFILES_TABLE)?;
-        let mut profiles: Vec<Profile> = table
-            .iter()?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|(_, v)| serde_json::from_slice(v.value()).ok())
-            .collect();
-        profiles.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(profiles)
-    }
-
-    fn active_profile(&self) -> Result<Profile> {
-        let db = self.db()?;
-        let read_txn = db.begin_read()?;
-        let settings = read_txn.open_table(SETTINGS_TABLE)?;
-        let key = active_profile_key(&local_owner());
-        let name = settings
-            .get(key.as_str())?
-            .map(|v| v.value().to_string())
-            .ok_or_else(|| anyhow!("no active profile set"))?;
-        let profiles = read_txn.open_table(PROFILES_TABLE)?;
-        let bytes = profiles.get(name.as_str())?.ok_or_else(|| anyhow!("active profile '{name}' not found"))?;
-        Ok(serde_json::from_slice(bytes.value())?)
-    }
-
-    fn use_profile(&self, name: &str) -> Result<()> {
-        let db = self.db()?;
-        {
-            let read_txn = db.begin_read()?;
-            let profiles = read_txn.open_table(PROFILES_TABLE)?;
-            if profiles.get(name)?.is_none() {
-                bail!("no profile named '{name}'");
-            }
-        }
-        let write_txn = db.begin_write()?;
-        {
-            let mut settings = write_txn.open_table(SETTINGS_TABLE)?;
-            let key = active_profile_key(&local_owner());
-            settings.insert(key.as_str(), name)?;
-        }
-        write_txn.commit()?;
-        self.touch_marker()?;
-        Ok(())
-    }
-
-    fn add_profile(&self, profile: Profile) -> Result<()> {
-        let db = self.db()?;
-        {
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(PROFILES_TABLE)?;
-            if table.get(profile.name.as_str())?.is_some() {
-                bail!("profile '{}' already exists", profile.name);
-            }
-        }
-        let bytes = serde_json::to_vec(&profile)?;
-        let write_txn = db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(PROFILES_TABLE)?;
-            table.insert(profile.name.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        self.touch_marker()?;
-        Ok(())
-    }
-
     fn set_claude_session_id(&self, id: u64, session_id: Option<String>) -> Result<()> {
         if let Some(mut task) = self.get(id)? {
             task.claude_session_id = session_id;
@@ -517,12 +525,610 @@ impl Store for RedbStore {
     }
 }
 
+impl ProfileStore for RedbStore {
+    fn list_profiles(&self) -> Result<Vec<Profile>> {
+        let mut config = load_config()?;
+        config.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(config.profiles)
+    }
+
+    fn active_profile(&self) -> Result<Profile> {
+        load_config()?.active_profile()
+    }
+
+    fn use_profile(&self, name: &str) -> Result<()> {
+        let mut config = load_config()?;
+        if config.find_profile(name).is_none() {
+            bail!("no profile named '{name}'");
+        }
+        config.active_profile = Some(name.to_string());
+        save_config(&config)
+    }
+
+    fn add_profile(&self, profile: Profile) -> Result<()> {
+        let mut config = load_config()?;
+        if config.find_profile(&profile.name).is_some() {
+            bail!("profile '{}' already exists", profile.name);
+        }
+        config.profiles.push(profile);
+        save_config(&config)
+    }
+}
+
+impl RoutineStore for RedbStore {
+    fn add_routine(&self, name: String) -> Result<Routine> {
+        let db = self.db()?;
+        {
+            let read_txn = db.begin_read()?;
+            let table = read_txn.open_table(ROUTINES_TABLE)?;
+            if table.get(name.as_str())?.is_some() {
+                bail!("routine '{name}' already exists");
+            }
+        }
+        let routine = Routine { name: name.clone(), exercises: Vec::new(), archived: false };
+        let bytes = serde_json::to_vec(&routine)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ROUTINES_TABLE)?;
+            table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(routine)
+    }
+
+    fn list_routines(&self) -> Result<Vec<Routine>> {
+        Ok(self.all_routines()?.into_iter().filter(|r| !r.archived).collect())
+    }
+
+    fn list_archived_routines(&self) -> Result<Vec<Routine>> {
+        Ok(self.all_routines()?.into_iter().filter(|r| r.archived).collect())
+    }
+
+    fn find_routine(&self, name: &str) -> Result<Option<Routine>> {
+        self.get_routine(name)
+    }
+
+    fn archive_routine(&self, name: &str) -> Result<()> {
+        if let Some(mut r) = self.get_routine(name)? {
+            r.archived = true;
+            self.put_routine(&r)?;
+        }
+        Ok(())
+    }
+
+    fn unarchive_routine(&self, name: &str) -> Result<()> {
+        if let Some(mut r) = self.get_routine(name)? {
+            r.archived = false;
+            self.put_routine(&r)?;
+        }
+        Ok(())
+    }
+
+    fn add_exercise(&self, routine: &str, exercise: Exercise) -> Result<()> {
+        let mut r = self.get_routine(routine)?.ok_or_else(|| anyhow!("no routine named '{routine}'"))?;
+        r.exercises.push(exercise);
+        self.put_routine(&r)
+    }
+
+    fn remove_exercise(&self, routine: &str, exercise_name: &str) -> Result<()> {
+        let mut r = self.get_routine(routine)?.ok_or_else(|| anyhow!("no routine named '{routine}'"))?;
+        if let Some(pos) = r.exercises.iter().position(|e| e.name == exercise_name) {
+            r.exercises.remove(pos);
+            self.put_routine(&r)?;
+        }
+        Ok(())
+    }
+
+    fn log_completion(&self, routine: &str, completed_on: i64, note: Option<String>) -> Result<RoutineCompletion> {
+        if self.get_routine(routine)?.is_none() {
+            bail!("no routine named '{routine}'");
+        }
+        let completion = RoutineCompletion { id: next_id_ns()?, routine_name: routine.to_string(), completed_on, note };
+        let bytes = serde_json::to_vec(&completion)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(COMPLETIONS_TABLE)?;
+            table.insert(completion.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(completion)
+    }
+
+    fn completion_history(&self, routine: &str) -> Result<Vec<RoutineCompletion>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(COMPLETIONS_TABLE)?;
+        let mut completions: Vec<RoutineCompletion> = table
+            .iter()?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|(_, v)| serde_json::from_slice::<RoutineCompletion>(v.value()).ok())
+            .filter(|c| c.routine_name == routine)
+            .collect();
+        completions.sort_by_key(|c| std::cmp::Reverse(c.completed_on));
+        Ok(completions)
+    }
+}
+
+impl RedbStore {
+    fn all_routines(&self) -> Result<Vec<Routine>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(ROUTINES_TABLE)?;
+        Ok(table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect())
+    }
+
+    fn get_routine(&self, name: &str) -> Result<Option<Routine>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(ROUTINES_TABLE)?;
+        match table.get(name)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn put_routine(&self, routine: &Routine) -> Result<()> {
+        let bytes = serde_json::to_vec(routine)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ROUTINES_TABLE)?;
+            table.insert(routine.name.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+}
+
+impl PersonStore for RedbStore {
+    fn add_person(&self, name: String, relationship: RelationshipKind) -> Result<Person> {
+        let person = Person::new(next_id_ns()?, name, relationship);
+        self.put_person(&person)?;
+        Ok(person)
+    }
+
+    fn list_people(&self) -> Result<Vec<Person>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(PEOPLE_TABLE)?;
+        Ok(table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect())
+    }
+
+    fn find_person(&self, id: u64) -> Result<Option<Person>> {
+        self.get_person(id)
+    }
+
+    fn remove_person(&self, id: u64) -> Result<()> {
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PEOPLE_TABLE)?;
+            table.remove(id)?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+
+    fn set_person_birthdate(&self, id: u64, birthdate: Option<i64>) -> Result<()> {
+        self.edit_person(id, |p| p.birthdate = birthdate)
+    }
+
+    fn add_person_dream(&self, id: u64, dream: String) -> Result<()> {
+        self.edit_person(id, |p| p.dreams_aspirations.push(dream))
+    }
+
+    fn remove_person_dream(&self, id: u64, dream: &str) -> Result<()> {
+        self.edit_person(id, |p| p.dreams_aspirations.retain(|d| d != dream))
+    }
+
+    fn add_person_hobby(&self, id: u64, hobby: String) -> Result<()> {
+        self.edit_person(id, |p| p.hobbies.push(hobby))
+    }
+
+    fn remove_person_hobby(&self, id: u64, hobby: &str) -> Result<()> {
+        self.edit_person(id, |p| p.hobbies.retain(|h| h != hobby))
+    }
+
+    fn add_person_attention_area(&self, id: u64, area: String) -> Result<()> {
+        self.edit_person(id, |p| p.attention_areas.push(area))
+    }
+
+    fn remove_person_attention_area(&self, id: u64, area: &str) -> Result<()> {
+        self.edit_person(id, |p| p.attention_areas.retain(|a| a != area))
+    }
+
+    fn set_person_preference(&self, id: u64, key: String, value: String) -> Result<()> {
+        self.edit_person(id, |p| match p.preferences.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => p.preferences.push((key, value)),
+        })
+    }
+
+    fn remove_person_preference(&self, id: u64, key: &str) -> Result<()> {
+        self.edit_person(id, |p| p.preferences.retain(|(k, _)| k != key))
+    }
+
+    fn set_person_notes(&self, id: u64, notes: String) -> Result<()> {
+        self.edit_person(id, |p| p.notes = notes)
+    }
+}
+
+impl RedbStore {
+    fn get_person(&self, id: u64) -> Result<Option<Person>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(PEOPLE_TABLE)?;
+        match table.get(id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn put_person(&self, person: &Person) -> Result<()> {
+        let bytes = serde_json::to_vec(person)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PEOPLE_TABLE)?;
+            table.insert(person.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+
+    fn edit_person(&self, id: u64, f: impl FnOnce(&mut Person)) -> Result<()> {
+        if let Some(mut person) = self.get_person(id)? {
+            f(&mut person);
+            self.put_person(&person)?;
+        }
+        Ok(())
+    }
+}
+
+impl CraftStore for RedbStore {
+    fn add_craft(&self, name: String, status: CraftStatus) -> Result<Craft> {
+        let db = self.db()?;
+        {
+            let read_txn = db.begin_read()?;
+            let table = read_txn.open_table(CRAFTS_TABLE)?;
+            if table.get(name.as_str())?.is_some() {
+                bail!("craft '{name}' already exists");
+            }
+        }
+        let craft = Craft { name: name.clone(), status, space: String::new(), standing: String::new(), trajectory: String::new() };
+        let bytes = serde_json::to_vec(&craft)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CRAFTS_TABLE)?;
+            table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(craft)
+    }
+
+    fn list_crafts(&self, status: Option<CraftStatus>) -> Result<Vec<Craft>> {
+        let all = self.all_crafts()?;
+        Ok(match status {
+            Some(s) => all.into_iter().filter(|c| c.status == s).collect(),
+            None => all,
+        })
+    }
+
+    fn find_craft(&self, name: &str) -> Result<Option<Craft>> {
+        self.get_craft(name)
+    }
+
+    fn remove_craft(&self, name: &str) -> Result<()> {
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CRAFTS_TABLE)?;
+            table.remove(name)?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+
+    fn set_craft_status(&self, name: &str, status: CraftStatus) -> Result<()> {
+        self.edit_craft(name, |c| c.status = status)
+    }
+
+    fn set_craft_space(&self, name: &str, space: String) -> Result<()> {
+        self.edit_craft(name, |c| c.space = space)
+    }
+
+    fn set_craft_standing(&self, name: &str, standing: String) -> Result<()> {
+        self.edit_craft(name, |c| c.standing = standing)
+    }
+
+    fn set_craft_trajectory(&self, name: &str, trajectory: String) -> Result<()> {
+        self.edit_craft(name, |c| c.trajectory = trajectory)
+    }
+
+    fn log_craft_session(&self, craft: &str, logged_on: i64, note: Option<String>) -> Result<CraftSession> {
+        if self.get_craft(craft)?.is_none() {
+            bail!("no craft named '{craft}'");
+        }
+        let session = CraftSession { id: next_id_ns()?, craft_name: craft.to_string(), logged_on, note };
+        let bytes = serde_json::to_vec(&session)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CRAFT_SESSIONS_TABLE)?;
+            table.insert(session.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(session)
+    }
+
+    fn craft_session_history(&self, craft: &str) -> Result<Vec<CraftSession>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(CRAFT_SESSIONS_TABLE)?;
+        let mut sessions: Vec<CraftSession> = table
+            .iter()?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|(_, v)| serde_json::from_slice::<CraftSession>(v.value()).ok())
+            .filter(|s| s.craft_name == craft)
+            .collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.logged_on));
+        Ok(sessions)
+    }
+}
+
+impl RedbStore {
+    fn all_crafts(&self) -> Result<Vec<Craft>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(CRAFTS_TABLE)?;
+        Ok(table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect())
+    }
+
+    fn get_craft(&self, name: &str) -> Result<Option<Craft>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(CRAFTS_TABLE)?;
+        match table.get(name)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn edit_craft(&self, name: &str, f: impl FnOnce(&mut Craft)) -> Result<()> {
+        if let Some(mut craft) = self.get_craft(name)? {
+            f(&mut craft);
+            let bytes = serde_json::to_vec(&craft)?;
+            let db = self.db()?;
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(CRAFTS_TABLE)?;
+                table.insert(craft.name.as_str(), bytes.as_slice())?;
+            }
+            write_txn.commit()?;
+            self.touch_marker()?;
+        }
+        Ok(())
+    }
+}
+
+impl StabilityStore for RedbStore {
+    fn add_stability_area(&self, name: String, status: StabilityStatus) -> Result<StabilityArea> {
+        let db = self.db()?;
+        {
+            let read_txn = db.begin_read()?;
+            let table = read_txn.open_table(STABILITY_AREAS_TABLE)?;
+            if table.get(name.as_str())?.is_some() {
+                bail!("stability area '{name}' already exists");
+            }
+        }
+        let area = StabilityArea { id: next_id_ns()?, name: name.clone(), status, standing: String::new(), trajectory: String::new() };
+        let bytes = serde_json::to_vec(&area)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(STABILITY_AREAS_TABLE)?;
+            table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(area)
+    }
+
+    fn list_stability_areas(&self, status: Option<StabilityStatus>) -> Result<Vec<StabilityArea>> {
+        let all = self.all_stability_areas()?;
+        Ok(match status {
+            Some(s) => all.into_iter().filter(|a| a.status == s).collect(),
+            None => all,
+        })
+    }
+
+    fn find_stability_area(&self, name: &str) -> Result<Option<StabilityArea>> {
+        self.get_stability_area(name)
+    }
+
+    fn remove_stability_area(&self, name: &str) -> Result<()> {
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(STABILITY_AREAS_TABLE)?;
+            table.remove(name)?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+
+    fn set_stability_status(&self, name: &str, status: StabilityStatus) -> Result<()> {
+        self.edit_stability_area(name, |a| a.status = status)
+    }
+
+    fn set_stability_standing(&self, name: &str, standing: String) -> Result<()> {
+        self.edit_stability_area(name, |a| a.standing = standing)
+    }
+
+    fn set_stability_trajectory(&self, name: &str, trajectory: String) -> Result<()> {
+        self.edit_stability_area(name, |a| a.trajectory = trajectory)
+    }
+}
+
+impl RedbStore {
+    fn all_stability_areas(&self) -> Result<Vec<StabilityArea>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(STABILITY_AREAS_TABLE)?;
+        Ok(table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect())
+    }
+
+    fn get_stability_area(&self, name: &str) -> Result<Option<StabilityArea>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(STABILITY_AREAS_TABLE)?;
+        match table.get(name)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn edit_stability_area(&self, name: &str, f: impl FnOnce(&mut StabilityArea)) -> Result<()> {
+        if let Some(mut area) = self.get_stability_area(name)? {
+            f(&mut area);
+            let bytes = serde_json::to_vec(&area)?;
+            let db = self.db()?;
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(STABILITY_AREAS_TABLE)?;
+                table.insert(area.name.as_str(), bytes.as_slice())?;
+            }
+            write_txn.commit()?;
+            self.touch_marker()?;
+        }
+        Ok(())
+    }
+}
+
+impl PrincipleStore for RedbStore {
+    fn add_principle(&self, text: String) -> Result<Principle> {
+        let principle = Principle { id: next_id_ns()?, created_at: now_unix()?, text };
+        let bytes = serde_json::to_vec(&principle)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PRINCIPLES_TABLE)?;
+            table.insert(principle.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(principle)
+    }
+
+    fn list_principles(&self) -> Result<Vec<Principle>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(PRINCIPLES_TABLE)?;
+        let mut principles: Vec<Principle> =
+            table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect();
+        principles.sort_by_key(|p| std::cmp::Reverse((p.created_at, p.id))); // id (ns-resolution) tiebreaks same-second entries
+        Ok(principles)
+    }
+
+    fn find_principle(&self, id: u64) -> Result<Option<Principle>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(PRINCIPLES_TABLE)?;
+        match table.get(id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn remove_principle(&self, id: u64) -> Result<()> {
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PRINCIPLES_TABLE)?;
+            table.remove(id)?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(())
+    }
+}
+
+impl JournalStore for RedbStore {
+    fn add_journal_entry(&self, kind: JournalEntryKind, content: String) -> Result<JournalEntry> {
+        let entry = JournalEntry { id: next_id_ns()?, created_at: now_unix()?, kind, content };
+        let bytes = serde_json::to_vec(&entry)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(JOURNAL_TABLE)?;
+            table.insert(entry.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        self.touch_marker()?;
+        Ok(entry)
+    }
+
+    fn list_journal_entries(&self) -> Result<Vec<JournalEntry>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(JOURNAL_TABLE)?;
+        let mut entries: Vec<JournalEntry> =
+            table.iter()?.filter_map(|entry| entry.ok()).filter_map(|(_, v)| serde_json::from_slice(v.value()).ok()).collect();
+        entries.sort_by_key(|e| std::cmp::Reverse((e.created_at, e.id))); // id (ns-resolution) tiebreaks same-second entries
+        Ok(entries)
+    }
+
+    fn find_journal_entry(&self, id: u64) -> Result<Option<JournalEntry>> {
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(JOURNAL_TABLE)?;
+        match table.get(id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn search_journal_entries(&self, query: &str) -> Result<Vec<JournalEntry>> {
+        let query = query.to_lowercase();
+        Ok(self.list_journal_entries()?.into_iter().filter(|e| e.content.to_lowercase().contains(&query)).collect())
+    }
+
+    fn last_checkin(&self) -> Result<Option<JournalEntry>> {
+        Ok(self.list_journal_entries()?.into_iter().find(|e| e.kind == JournalEntryKind::CheckIn))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::craft::CraftStatus;
+    use crate::journal::JournalEntryKind;
+    use crate::person::RelationshipKind;
+    use crate::routine::Exercise;
+    use crate::stability::StabilityStatus;
 
     fn temp_path(label: &str) -> String {
         std::env::temp_dir().join(format!("way-store-test-{label}-{}.redb", std::process::id())).to_str().unwrap().to_string()
+    }
+
+    /// Points config.toml at an isolated scratch file for the duration of
+    /// this test's thread, so profile-related tests don't read/clobber the
+    /// real `~/.config/way/config.toml` or race other concurrently-running
+    /// tests (thread-local, not an env var - cargo test runs `#[test]`s on
+    /// separate OS threads, and env vars are process-global).
+    fn isolate_config(label: &str) {
+        let path = std::env::temp_dir().join(format!("way-config-test-{label}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        crate::config::set_config_path_override(Some(path));
     }
 
     #[test]
@@ -545,6 +1151,7 @@ mod tests {
 
     #[test]
     fn old_records_without_pillar_still_deserialize() {
+        isolate_config("no-pillar");
         let path = temp_path("no-pillar");
         let _ = std::fs::remove_file(&path);
 
@@ -622,37 +1229,8 @@ mod tests {
     }
 
     #[test]
-    fn active_profile_is_scoped_by_local_owner_not_global() {
-        let path = temp_path("active-profile-scope");
-        let _ = std::fs::remove_file(&path);
-
-        let store = RedbStore::open(&path).unwrap(); // bootstraps "personal" for local_owner()
-        store
-            .add_profile(Profile { name: "other".to_string(), pillars: vec![], default_issue_system: None, phases: vec![] })
-            .unwrap();
-
-        // Plant an active-profile setting for a different owner, simulating what a
-        // shared store will eventually hold once real multi-user access exists.
-        {
-            let db = Database::create(&path).unwrap();
-            let write_txn = db.begin_write().unwrap();
-            {
-                let mut settings = write_txn.open_table(SETTINGS_TABLE).unwrap();
-                let foreign_key = active_profile_key("someone-else");
-                settings.insert(foreign_key.as_str(), "other").unwrap();
-            }
-            write_txn.commit().unwrap();
-        }
-
-        // local_owner()'s own active profile must be unaffected by another owner's setting.
-        let active = store.active_profile().unwrap();
-        assert_eq!(active.name, "personal");
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
     fn fresh_store_bootstraps_default_personal_profile() {
+        isolate_config("bootstrap");
         let path = temp_path("bootstrap");
         let _ = std::fs::remove_file(&path);
 
@@ -706,6 +1284,7 @@ mod tests {
 
     #[test]
     fn session_phase_decisions_and_next_round_trip_independently_and_share_updated_at() {
+        isolate_config("session");
         let path = temp_path("session");
         let _ = std::fs::remove_file(&path);
 
@@ -791,6 +1370,7 @@ mod tests {
 
     #[test]
     fn phase_order_is_enforced_only_when_the_active_profile_configures_one() {
+        isolate_config("phase-order");
         let path = temp_path("phase-order");
         let _ = std::fs::remove_file(&path);
 
@@ -861,6 +1441,7 @@ mod tests {
 
     #[test]
     fn pillar_assignment_rejects_name_not_in_active_profile() {
+        isolate_config("pillarcheck");
         let path = temp_path("pillarcheck");
         let _ = std::fs::remove_file(&path);
 
@@ -949,6 +1530,159 @@ mod tests {
 
         let seen_by_parent = parent.find_by_key(task.key).unwrap().unwrap();
         assert_eq!(seen_by_parent.phase, Some("in-flight".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn routine_aggregates_and_completion_history() {
+        let path = temp_path("routine");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        store.add_routine("push day".to_string()).unwrap();
+        assert!(store.add_routine("push day".to_string()).is_err(), "duplicate name must be rejected");
+
+        store
+            .add_exercise("push day", Exercise { name: "bench".to_string(), sets: 4, reps: 8, intensity: 0.8, friction: 0.6, duration_secs: 600 })
+            .unwrap();
+        let r = store.find_routine("push day").unwrap().unwrap();
+        assert_eq!(r.exercises.len(), 1);
+        assert_eq!(r.duration_secs(), 600);
+
+        store.remove_exercise("push day", "bench").unwrap();
+        let r = store.find_routine("push day").unwrap().unwrap();
+        assert!(r.exercises.is_empty());
+
+        store.archive_routine("push day").unwrap();
+        assert!(store.list_routines().unwrap().is_empty());
+        assert_eq!(store.list_archived_routines().unwrap().len(), 1);
+
+        // logging a completion never requires the routine to be active (R10)
+        store.log_completion("push day", 1000, Some("felt strong".to_string())).unwrap();
+        store.log_completion("push day", 2000, None).unwrap();
+        let history = store.completion_history("push day").unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].completed_on, 2000, "reverse chronological");
+
+        assert!(store.log_completion("nonexistent", 1000, None).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn person_crud_and_list_mutators() {
+        let path = temp_path("person");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let a = store.add_person("youngest".to_string(), RelationshipKind::Child).unwrap();
+        let b = store.add_person("youngest".to_string(), RelationshipKind::Child).unwrap();
+        assert_ne!(a.id, b.id, "duplicate names are allowed - id-keyed, not name-keyed");
+
+        store.add_person_hobby(a.id, "skateboarding".to_string()).unwrap();
+        store.add_person_hobby(a.id, "drawing".to_string()).unwrap();
+        store.remove_person_hobby(a.id, "drawing".to_string().as_str()).unwrap();
+        let reloaded = store.find_person(a.id).unwrap().unwrap();
+        assert_eq!(reloaded.hobbies, vec!["skateboarding".to_string()]);
+
+        store.set_person_preference(a.id, "gatorade flavor".to_string(), "glacier freeze".to_string()).unwrap();
+        store.set_person_preference(a.id, "gatorade flavor".to_string(), "blue".to_string()).unwrap();
+        let reloaded = store.find_person(a.id).unwrap().unwrap();
+        assert_eq!(reloaded.preferences, vec![("gatorade flavor".to_string(), "blue".to_string())], "upsert, not append");
+
+        store.remove_person(a.id).unwrap();
+        assert!(store.find_person(a.id).unwrap().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn craft_status_filter_and_session_log() {
+        let path = temp_path("craft");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        store.add_craft("skateboarding".to_string(), CraftStatus::Active).unwrap();
+        store.add_craft("woodworking".to_string(), CraftStatus::Dormant).unwrap();
+        assert!(store.add_craft("skateboarding".to_string(), CraftStatus::Active).is_err());
+
+        assert_eq!(store.list_crafts(None).unwrap().len(), 2);
+        assert_eq!(store.list_crafts(Some(CraftStatus::Active)).unwrap().len(), 1);
+
+        store.set_craft_standing("skateboarding", "landed 50-50 stalls".to_string()).unwrap();
+        let c = store.find_craft("skateboarding").unwrap().unwrap();
+        assert_eq!(c.standing, "landed 50-50 stalls");
+
+        // logging never requires Active (dormant woodworking still loggable)
+        store.log_craft_session("woodworking", 1000, None).unwrap();
+        store.log_craft_session("woodworking", 2000, None).unwrap();
+        assert_eq!(store.craft_session_history("woodworking").unwrap().len(), 2);
+        assert!(store.log_craft_session("nonexistent", 1000, None).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn stability_area_crud() {
+        let path = temp_path("stability");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        store.add_stability_area("safety net".to_string(), StabilityStatus::Active).unwrap();
+        store.set_stability_standing("safety net", "6mo expenses".to_string()).unwrap();
+        store.set_stability_trajectory("safety net", "increase transfer".to_string()).unwrap();
+
+        let area = store.find_stability_area("safety net").unwrap().unwrap();
+        assert_eq!(area.standing, "6mo expenses");
+        assert_eq!(area.trajectory, "increase transfer");
+
+        store.set_stability_status("safety net", StabilityStatus::Dormant).unwrap();
+        assert_eq!(store.list_stability_areas(Some(StabilityStatus::Dormant)).unwrap().len(), 1);
+        assert_eq!(store.list_stability_areas(Some(StabilityStatus::Active)).unwrap().len(), 0);
+
+        store.remove_stability_area("safety net").unwrap();
+        assert!(store.find_stability_area("safety net").unwrap().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn principle_append_only_and_delete() {
+        let path = temp_path("principle");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        let p1 = store.add_principle("first".to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let p2 = store.add_principle("second".to_string()).unwrap();
+
+        let list = store.list_principles().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, p2.id, "reverse chronological");
+
+        store.remove_principle(p1.id).unwrap();
+        assert!(store.find_principle(p1.id).unwrap().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn journal_entries_search_and_last_checkin() {
+        let path = temp_path("journal");
+        let _ = std::fs::remove_file(&path);
+
+        let store = RedbStore::open(&path).unwrap();
+        store.add_journal_entry(JournalEntryKind::Freeform, "woke up thinking about the HOA board".to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let checkin = store.add_journal_entry(JournalEntryKind::CheckIn, "Q: attention?\nA: way's vision work".to_string()).unwrap();
+
+        let results = store.search_journal_entries("hoa").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(store.search_journal_entries("nonexistent-term").unwrap().is_empty());
+
+        let last = store.last_checkin().unwrap().unwrap();
+        assert_eq!(last.id, checkin.id);
 
         std::fs::remove_file(&path).unwrap();
     }
