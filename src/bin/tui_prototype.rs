@@ -183,6 +183,22 @@ enum ERow<'a> {
     Item(&'a Item),
 }
 
+// Fake sprint assignment for variant F's mockup - rendering-layer only,
+// not a real Sprint entity (see issue #30). Picked by title since Item
+// has no sprint field and touching every fixture literal for a throwaway
+// grouping isn't worth it.
+const SPRINT_TITLES: [&str; 3] = ["spike: quality autonomous workflows", "fix: read/write lock handling", "push day - logged"];
+
+fn in_sprint(item: &Item) -> bool {
+    SPRINT_TITLES.contains(&item.title)
+}
+
+enum FRow<'a> {
+    SprintHeader { count: usize },
+    BacklogHeader { count: usize },
+    Item(&'a Item),
+}
+
 struct App {
     variant: usize,
     items: Vec<Item>,
@@ -210,12 +226,17 @@ struct App {
     e_filter_mode: bool,
     e_filter: String,
     e_detail_open: bool,
+    // variant F - full jira: sprint section(s) + backlog section, epic chips
+    f_selected: usize,
+    f_sprint_collapsed: bool,
+    f_backlog_collapsed: bool,
+    f_detail_open: bool,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            variant: 4, // open on E — jira-backlog structure, the current best candidate
+            variant: 5, // open on F — full jira: sprint(s) + backlog + epic chips
             items: fixture(),
             selected: 0,
             pillar_filter: 1, // start on "mind", not "all" - a real tab, not the catch-all
@@ -236,7 +257,30 @@ impl App {
             e_filter_mode: false,
             e_filter: String::new(),
             e_detail_open: false,
+            f_selected: 0,
+            f_sprint_collapsed: false,
+            f_backlog_collapsed: false,
+            f_detail_open: false,
         }
+    }
+
+    // Sprint section first (Jira convention: active sprint(s) above the
+    // backlog), then a flat, priority-ordered Backlog section - order in
+    // `items` stands in for priority order, no epic sub-grouping within
+    // either section (epic/pillar shows as a per-row color chip instead).
+    fn f_rows(&self) -> Vec<FRow<'_>> {
+        let sprint_items: Vec<&Item> = self.items.iter().filter(|it| in_sprint(it)).collect();
+        let backlog_items: Vec<&Item> = self.items.iter().filter(|it| !in_sprint(it)).collect();
+
+        let mut rows = vec![FRow::SprintHeader { count: sprint_items.len() }];
+        if !self.f_sprint_collapsed {
+            rows.extend(sprint_items.into_iter().map(FRow::Item));
+        }
+        rows.push(FRow::BacklogHeader { count: backlog_items.len() });
+        if !self.f_backlog_collapsed {
+            rows.extend(backlog_items.into_iter().map(FRow::Item));
+        }
+        rows
     }
 
     fn filtered_a(&self) -> Vec<&Item> {
@@ -315,15 +359,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
             match key.code {
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.variant = (app.variant + 4) % 5;
+                    app.variant = (app.variant + 5) % 6;
                     continue;
                 }
                 KeyCode::Tab => {
-                    app.variant = (app.variant + 1) % 5;
+                    app.variant = (app.variant + 1) % 6;
                     continue;
                 }
                 KeyCode::BackTab => {
-                    app.variant = (app.variant + 4) % 5;
+                    app.variant = (app.variant + 5) % 6;
                     continue;
                 }
                 _ => {}
@@ -339,6 +383,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 2 => handle_variant_c(app, key.code),
                 3 => handle_variant_d(app, key.code),
                 4 => handle_variant_e(app, key.code),
+                5 => handle_variant_f(app, key.code),
                 _ => unreachable!(),
             }
         }
@@ -1040,6 +1085,126 @@ fn draw_variant_e(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+// ---------- Variant F: full jira - sprint section + backlog, epic chips ----------
+//
+// Nick: "i think i want the full jira view, not whatever this tree is.
+// backlog organization + prioritized scrum periods (sprints)." Real
+// Sprint semantics are a separate domain question (issue #30, not
+// decided here) - this is a rendering-layer mockup: a Sprint section
+// (fake assignment, see SPRINT_TITLES) above a flat, priority-ordered
+// Backlog section, each row carrying a small epic/pillar color chip
+// instead of grouping by pillar the way E did.
+
+fn handle_variant_f(app: &mut App, key: KeyCode) {
+    if app.f_detail_open {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => app.f_detail_open = false,
+            _ => {}
+        }
+        return;
+    }
+    let rows = app.f_rows();
+    let len = rows.len().max(1);
+    match key {
+        KeyCode::Char('j') | KeyCode::Down => app.f_selected = (app.f_selected + 1) % len,
+        KeyCode::Char('k') | KeyCode::Up => app.f_selected = (app.f_selected + len - 1) % len,
+        KeyCode::Enter => match rows.get(app.f_selected) {
+            Some(FRow::SprintHeader { .. }) => app.f_sprint_collapsed = !app.f_sprint_collapsed,
+            Some(FRow::BacklogHeader { .. }) => app.f_backlog_collapsed = !app.f_backlog_collapsed,
+            Some(FRow::Item(_)) => app.f_detail_open = true,
+            None => {}
+        },
+        _ => {}
+    }
+}
+
+fn epic_chip(pillar: &str) -> Span<'static> {
+    Span::styled(format!(" {pillar} "), Style::default().bg(pillar_color(pillar)).fg(theme::SELECT_BG))
+}
+
+fn draw_variant_f(frame: &mut Frame, app: &App, area: Rect) {
+    let rows_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("way › backlog   {} items", app.items.len()), Style::default().fg(theme::DIM)))),
+        rows_layout[0],
+    );
+
+    let f_rows = app.f_rows();
+    let lines: Vec<Line> = f_rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let selected = i == app.f_selected;
+            match row {
+                FRow::SprintHeader { count } => {
+                    let arrow = if app.f_sprint_collapsed { "▸" } else { "▾" };
+                    let marker = if selected { Span::styled("▎", Style::default().fg(theme::AQUA)) } else { Span::raw(" ") };
+                    Line::from(vec![
+                        marker,
+                        Span::styled(format!(" {arrow} "), Style::default().fg(theme::AQUA)),
+                        Span::styled(" SPRINT 14 ", Style::default().bg(theme::AQUA).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD)),
+                        Span::styled("  Aug 1 – Aug 14  ·  goal: land the UX track  ·  ", Style::default().fg(theme::DIM)),
+                        Span::styled(format!("{count} items"), Style::default().fg(theme::DIM)),
+                    ])
+                }
+                FRow::BacklogHeader { count } => {
+                    let arrow = if app.f_backlog_collapsed { "▸" } else { "▾" };
+                    let marker = if selected { Span::styled("▎", Style::default().fg(theme::DIM)) } else { Span::raw(" ") };
+                    Line::from(vec![
+                        marker,
+                        Span::styled(format!(" {arrow} "), Style::default().fg(theme::DIM)),
+                        Span::styled("BACKLOG", Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("  ({count})  — priority order"), Style::default().fg(theme::DIM)),
+                    ])
+                }
+                FRow::Item(item) => {
+                    let marker = if selected { Span::styled("▎", Style::default().fg(pillar_color(item.pillar))) } else { Span::raw(" ") };
+                    let title_style = if selected { Style::default().fg(theme::FG).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::FG) };
+                    Line::from(vec![
+                        marker,
+                        Span::raw("   "),
+                        Span::styled(format!("{} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar))),
+                        Span::styled(format!("{:<36}", item.title), title_style),
+                        epic_chip(item.pillar),
+                        Span::styled(format!("  {}", item.meta), Style::default().fg(theme::DIM)),
+                    ])
+                }
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows_layout[1]);
+
+    if app.f_detail_open {
+        if let Some(FRow::Item(item)) = f_rows.get(app.f_selected) {
+            let popup = centered_rect(area, 76, 70);
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(pillar_color(item.pillar)))
+                .title(Line::from(vec![
+                    Span::styled(format!(" {} ", kind_glyph(item.kind)), Style::default().fg(pillar_color(item.pillar)).add_modifier(Modifier::BOLD)),
+                    Span::styled(item.title, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                ]));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            let padded = Rect { x: inner.x + 1, y: inner.y, width: inner.width.saturating_sub(2), height: inner.height };
+            frame.render_widget(Paragraph::new(detail_lines(item)).wrap(ratatui::widgets::Wrap { trim: false }), padded);
+        }
+    }
+
+    let pos = format!("{}/{}", if f_rows.is_empty() { 0 } else { app.f_selected + 1 }, f_rows.len());
+    let mode_badge = Span::styled(" NORMAL ", Style::default().bg(theme::GREEN).fg(theme::SELECT_BG).add_modifier(Modifier::BOLD));
+    let breadcrumb = Span::styled("  way › backlog   ", Style::default().fg(theme::FG));
+    let hint = Span::styled("j/k move  enter open/collapse  Tab variant  q quit   ", Style::default().fg(theme::DIM));
+    frame.render_widget(Paragraph::new(Line::from(vec![mode_badge, breadcrumb, hint, Span::styled(pos, Style::default().fg(theme::DIM))])), rows_layout[2]);
+}
+
 // ---------- shared frame ----------
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -1052,6 +1217,7 @@ fn draw(frame: &mut Frame, app: &App) {
         2 => draw_variant_c(frame, app, rows[0]),
         3 => draw_variant_d(frame, app, rows[0]),
         4 => draw_variant_e(frame, app, rows[0]),
+        5 => draw_variant_f(frame, app, rows[0]),
         _ => unreachable!(),
     }
 
@@ -1061,6 +1227,7 @@ fn draw(frame: &mut Frame, app: &App) {
         "C — focused pager + quick-switch",
         "D — Zellij tabs + Helix status/command",
         "E — unified backlog (jira structure)",
+        "F — full jira: sprint + backlog + epic chips",
     ];
     let indicator = Line::from(vec![
         Span::styled(" PROTOTYPE ", Style::default().bg(theme::RED).fg(theme::FG).add_modifier(Modifier::BOLD)),
